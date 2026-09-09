@@ -1,10 +1,21 @@
 from collections.abc import Iterable
+from io import BytesIO
+from math import cos, radians, sin
 from pathlib import Path
 
 import pymupdf
 from fastapi import HTTPException, status
+from PIL import Image, ImageEnhance, UnidentifiedImageError
 
-from app.schemas import BlankPage, DocumentMetadata, ExportRequest, PageMetadata, SourcePage
+from app.schemas import (
+    BlankPage,
+    DocumentMetadata,
+    ExportRequest,
+    PageMetadata,
+    SourcePage,
+    WatermarkMetadata,
+    WatermarkSpec,
+)
 from app.services.storage import FileStorage
 
 PDF_SIGNATURE = b"%PDF-"
@@ -63,6 +74,35 @@ class PdfService:
             matrix = pymupdf.Matrix(scale, scale)
             return page.get_pixmap(matrix=matrix, alpha=False).tobytes("png")
 
+    def create_watermark(
+        self,
+        content: bytes,
+        filename: str,
+        destination: Path,
+        watermark_id: str,
+    ) -> WatermarkMetadata:
+        try:
+            with Image.open(BytesIO(content)) as image:
+                if image.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise ValueError("unsupported watermark image format")
+                normalized = image.convert("RGBA")
+                normalized.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+                normalized.save(destination, format="PNG", optimize=True)
+                width, height = normalized.size
+        except (ValueError, UnidentifiedImageError, OSError) as exc:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="watermark must be a valid PNG, JPEG, or WebP image",
+            ) from exc
+        return WatermarkMetadata(
+            id=watermark_id,
+            filename=filename,
+            width=width,
+            height=height,
+            preview_url=f"/api/v1/watermarks/{watermark_id}/preview",
+        )
+
     @staticmethod
     def _crop_rect(page: pymupdf.Page, spec: SourcePage) -> pymupdf.Rect:
         rect = page.rect
@@ -76,6 +116,48 @@ class PdfService:
             rect.y1 - rect.height * crop.bottom,
         )
 
+    def _apply_watermark(self, page: pymupdf.Page, spec: WatermarkSpec | None) -> None:
+        if spec is None:
+            return
+        watermark_path = self.storage.watermark_path(spec.watermark_id)
+        try:
+            with Image.open(watermark_path) as source:
+                image = source.convert("RGBA")
+                alpha = image.getchannel("A")
+                image.putalpha(ImageEnhance.Brightness(alpha).enhance(spec.opacity))
+                base_width = page.rect.width * spec.scale
+                base_height = base_width * image.height / image.width
+                if spec.rotation:
+                    image = image.rotate(
+                        -spec.rotation,
+                        expand=True,
+                        resample=Image.Resampling.BICUBIC,
+                    )
+                angle = radians(spec.rotation)
+                target_width = abs(base_width * cos(angle)) + abs(base_height * sin(angle))
+                target_height = abs(base_width * sin(angle)) + abs(base_height * cos(angle))
+                center_x = page.rect.width * spec.x
+                center_y = page.rect.height * spec.y
+                target = pymupdf.Rect(
+                    center_x - target_width / 2,
+                    center_y - target_height / 2,
+                    center_x + target_width / 2,
+                    center_y + target_height / 2,
+                )
+                buffer = BytesIO()
+                image.save(buffer, format="PNG", optimize=True)
+                page.insert_image(
+                    target,
+                    stream=buffer.getvalue(),
+                    overlay=True,
+                    keep_proportion=False,
+                )
+        except (UnidentifiedImageError, OSError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"watermark {spec.watermark_id} could not be rendered",
+            ) from exc
+
     def compose(self, request: ExportRequest, destination: Path) -> None:
         output = pymupdf.open()
         open_sources: dict[str, pymupdf.Document] = {}
@@ -85,7 +167,8 @@ class PdfService:
                     width, height = spec.width, spec.height
                     if spec.rotation in (90, 270):
                         width, height = height, width
-                    output.new_page(width=width, height=height)
+                    target_page = output.new_page(width=width, height=height)
+                    self._apply_watermark(target_page, spec.watermark)
                     continue
 
                 source = open_sources.get(spec.document_id)
@@ -112,6 +195,7 @@ class PdfService:
                     rotate=spec.rotation,
                     keep_proportion=False,
                 )
+                self._apply_watermark(target_page, spec.watermark)
 
             output.set_metadata({"producer": "PDF Editor", "title": request.filename})
             output.save(destination, garbage=4, deflate=True)
@@ -127,3 +211,5 @@ class PdfService:
         for spec in specs:
             if isinstance(spec, SourcePage):
                 self.storage.original_path(spec.document_id)
+            if spec.watermark is not None:
+                self.storage.watermark_path(spec.watermark.watermark_id)

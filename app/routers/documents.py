@@ -5,11 +5,13 @@ from fastapi.responses import FileResponse, Response
 
 from app.config import settings
 from app.dependencies import get_pdf_service, get_storage
-from app.schemas import DocumentMetadata, ExportRequest, ExportResponse
+from app.schemas import DocumentMetadata, ExportRequest, ExportResponse, WatermarkMetadata
 from app.services.pdf_service import PdfService
 from app.services.storage import FileStorage, safe_pdf_filename
 
 router = APIRouter()
+WATERMARK_MAX_BYTES = 20 * 1024 * 1024
+WATERMARK_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
 
 
 @router.post(
@@ -53,6 +55,52 @@ def page_preview(
 ) -> Response:
     return Response(
         content=pdf_service.render_preview(document_id, page_index, scale),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.post(
+    "/watermarks",
+    response_model=WatermarkMetadata,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_watermark(
+    file: Annotated[UploadFile, File(description="PNG, JPEG, or WebP watermark image")],
+    storage: Annotated[FileStorage, Depends(get_storage)],
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+) -> WatermarkMetadata:
+    if file.content_type not in WATERMARK_CONTENT_TYPES:
+        await file.close()
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="watermark only supports PNG, JPEG, and WebP images",
+        )
+    if file.size is not None and file.size > WATERMARK_MAX_BYTES:
+        await file.close()
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="watermark exceeds 20 MB limit",
+        )
+    content = await file.read(WATERMARK_MAX_BYTES + 1)
+    filename = file.filename or "watermark"
+    await file.close()
+    if len(content) > WATERMARK_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="watermark exceeds 20 MB limit",
+        )
+    watermark_id, destination = storage.allocate_watermark()
+    return pdf_service.create_watermark(content, filename, destination, watermark_id)
+
+
+@router.get("/watermarks/{watermark_id}/preview")
+def watermark_preview(
+    watermark_id: str,
+    storage: Annotated[FileStorage, Depends(get_storage)],
+) -> FileResponse:
+    return FileResponse(
+        storage.watermark_path(watermark_id),
         media_type="image/png",
         headers={"Cache-Control": "private, max-age=3600"},
     )

@@ -1,7 +1,9 @@
+from io import BytesIO
 from pathlib import Path
 
 import pymupdf
 from fastapi.testclient import TestClient
+from PIL import Image, ImageDraw
 
 
 def upload_sample(client: TestClient, sample_pdf: Path) -> dict:
@@ -93,3 +95,79 @@ def test_local_development_cors(client: TestClient) -> None:
     )
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+
+
+def test_upload_and_apply_watermark_to_multiple_pages(
+    client: TestClient,
+    sample_pdf: Path,
+) -> None:
+    watermark_image = Image.new("RGBA", (320, 100), (255, 255, 255, 0))
+    draw = ImageDraw.Draw(watermark_image)
+    draw.rounded_rectangle((2, 2, 317, 97), radius=14, fill=(210, 45, 45, 220))
+    draw.text((85, 38), "WATERMARK", fill="white")
+    watermark_stream = BytesIO()
+    watermark_image.save(watermark_stream, format="PNG")
+
+    upload = client.post(
+        "/api/v1/watermarks",
+        files=[("file", ("stamp.png", watermark_stream.getvalue(), "image/png"))],
+    )
+    assert upload.status_code == 201, upload.text
+    watermark = upload.json()
+    assert watermark["filename"] == "stamp.png"
+    preview = client.get(watermark["preview_url"])
+    assert preview.status_code == 200
+    assert preview.content.startswith(b"\x89PNG")
+
+    document = upload_sample(client, sample_pdf)
+    watermark_spec = {
+        "watermark_id": watermark["id"],
+        "rotation": 37,
+        "scale": 0.42,
+        "opacity": 0.3,
+        "x": 0.62,
+        "y": 0.44,
+    }
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "filename": "watermarked.pdf",
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "watermark": watermark_spec,
+                },
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 1,
+                    "watermark": watermark_spec,
+                },
+            ],
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    assert output.page_count == 2
+    assert len(output[0].get_images(full=True)) >= 1
+    assert len(output[1].get_images(full=True)) >= 1
+    output.close()
+
+
+def test_rejects_pdf_and_oversized_watermarks_before_decoding(client: TestClient) -> None:
+    pdf_response = client.post(
+        "/api/v1/watermarks",
+        files=[("file", ("mistake.pdf", b"%PDF-1.7\n", "application/pdf"))],
+    )
+    assert pdf_response.status_code == 415
+    assert "only supports PNG" in pdf_response.json()["detail"]
+
+    oversized_response = client.post(
+        "/api/v1/watermarks",
+        files=[("file", ("too-large.png", b"x" * (20 * 1024 * 1024 + 1), "image/png"))],
+    )
+    assert oversized_response.status_code == 413
+    assert oversized_response.json()["detail"] == "watermark exceeds 20 MB limit"

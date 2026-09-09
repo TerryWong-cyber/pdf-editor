@@ -20,8 +20,10 @@ class FileStorage:
         self.root = root.resolve()
         self.originals = self.root / "originals"
         self.exports = self.root / "exports"
+        self.watermarks = self.root / "watermarks"
         self.originals.mkdir(parents=True, exist_ok=True)
         self.exports.mkdir(parents=True, exist_ok=True)
+        self.watermarks.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _validated_id(file_id: str) -> str:
@@ -45,6 +47,12 @@ class FileStorage:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="export not found")
         return path
 
+    def watermark_path(self, watermark_id: str) -> Path:
+        path = self.watermarks / f"{self._validated_id(watermark_id)}.png"
+        if not path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="watermark not found")
+        return path
+
     async def save_original(self, upload: UploadFile, max_bytes: int) -> tuple[str, Path]:
         document_id = str(uuid4())
         destination = self.originals / f"{document_id}.pdf"
@@ -55,7 +63,7 @@ class FileStorage:
                     total += len(chunk)
                     if total > max_bytes:
                         raise HTTPException(
-                            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                             detail=f"file exceeds {max_bytes // (1024 * 1024)} MB limit",
                         )
                     stream.write(chunk)
@@ -69,3 +77,7 @@ class FileStorage:
     def allocate_export(self) -> tuple[str, Path]:
         export_id = str(uuid4())
         return export_id, self.exports / f"{export_id}.pdf"
+
+    def allocate_watermark(self) -> tuple[str, Path]:
+        watermark_id = str(uuid4())
+        return watermark_id, self.watermarks / f"{watermark_id}.png"

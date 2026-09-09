@@ -19,11 +19,13 @@ frontend development by default.
 
 - `POST /api/v1/documents`: upload one or more PDFs. Multiple files are appended in upload order.
 - `GET /api/v1/documents/{id}/pages/{page}/preview`: render a page thumbnail.
+- `POST /api/v1/watermarks`: upload and normalize a PNG, JPEG, or WebP watermark image.
 - `POST /api/v1/exports`: compose arbitrary source pages and blank pages into a new PDF.
 - `GET /api/v1/exports/{id}/download`: download the generated copy.
 
 Delete, copy, reorder, extract, merge, rotate, crop, and blank-page creation all map to the
-ordered `pages` array accepted by the export endpoint.
+ordered `pages` array accepted by the export endpoint. Each page can also carry a watermark
+configuration with arbitrary rotation, page-relative scale, opacity, and normalized position.
 
 ## Tests
 

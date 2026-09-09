@@ -30,12 +30,22 @@ class CropBox(BaseModel):
         return self
 
 
+class WatermarkSpec(BaseModel):
+    watermark_id: str
+    rotation: Annotated[float, Field(ge=-180, le=180)] = 0
+    scale: Annotated[float, Field(ge=0.05, le=1)] = 0.35
+    opacity: Annotated[float, Field(ge=0.05, le=1)] = 0.35
+    x: Annotated[float, Field(ge=0, le=1)] = 0.5
+    y: Annotated[float, Field(ge=0, le=1)] = 0.5
+
+
 class SourcePage(BaseModel):
     kind: Literal["source"]
     document_id: str
     page_index: Annotated[int, Field(ge=0)]
     rotation: Literal[0, 90, 180, 270] = 0
     crop: CropBox | None = None
+    watermark: WatermarkSpec | None = None
 
 
 class BlankPage(BaseModel):
@@ -43,6 +53,7 @@ class BlankPage(BaseModel):
     width: Annotated[float, Field(gt=0, le=2880)] = 595
     height: Annotated[float, Field(gt=0, le=2880)] = 842
     rotation: Literal[0, 90, 180, 270] = 0
+    watermark: WatermarkSpec | None = None
 
 
 PageSpec = Annotated[SourcePage | BlankPage, Field(discriminator="kind")]
@@ -59,3 +70,10 @@ class ExportResponse(BaseModel):
     page_count: int
     download_url: str
 
+
+class WatermarkMetadata(BaseModel):
+    id: str
+    filename: str
+    width: int
+    height: int
+    preview_url: str
