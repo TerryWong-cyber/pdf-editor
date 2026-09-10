@@ -1,6 +1,6 @@
 # PDF Editor API
 
-FastAPI service for coarse-grained, non-destructive PDF editing. Uploaded originals are
+FastAPI service for non-destructive, layout-aware PDF editing. Uploaded originals are
 immutable; every save or extraction creates a new PDF in the export store.
 
 ## Run locally
@@ -19,6 +19,10 @@ frontend development by default.
 
 - `POST /api/v1/documents`: upload one or more PDFs. Multiple files are appended in upload order.
 - `GET /api/v1/documents/{id}/pages/{page}/preview`: render a page thumbnail.
+- `GET /api/v1/documents/{id}/pages/{page}/edit-background`: render the page background with text removed.
+- `GET /api/v1/documents/{id}/pages/{page}/content`: parse blocks, lines, styled spans, and
+  character-level geometry.
+- `GET /api/v1/documents/{id}/fonts/{xref}`: serve a browser-compatible embedded font.
 - `POST /api/v1/watermarks`: upload and normalize a PNG, JPEG, or WebP watermark image.
 - `POST /api/v1/exports`: compose arbitrary source pages and blank pages into a new PDF.
 - `GET /api/v1/exports/{id}/download`: download the generated copy.
@@ -26,6 +30,56 @@ frontend development by default.
 Delete, copy, reorder, extract, merge, rotate, crop, and blank-page creation all map to the
 ordered `pages` array accepted by the export endpoint. Each page can also carry a watermark
 configuration with arbitrary rotation, page-relative scale, opacity, and normalized position.
+Source pages may additionally carry `text_edits`; export redacts only those original text boxes
+and writes their replacement text into the new copy. Multilingual output selects the configured
+Noto font by script. The server paths are listed in `.env.example`.
+When the source PDF embeds a compatible font and it contains every newly entered glyph, the
+exporter reuses that font program. Otherwise it falls back to the configured Noto font rather
+than risking missing glyphs from a subset font.
+
+## Fine-grained text editing
+
+Each text block returned by the content endpoint retains its legacy summary fields and now also
+contains `lines[].spans[].characters[]`. A span includes its stable ID, text, bounding box,
+baseline origin, direction (on its parent line), font resource candidates, font size, color,
+opacity, style flags, ascender, descender, and per-character positions. `layout_version` is `2`,
+and all returned geometry uses the rotated-page coordinate space displayed by the preview API.
+
+For format-preserving edits, send one run per changed span. Unchanged spans are left untouched:
+
+```json
+{
+  "filename": "edited-copy.pdf",
+  "pages": [
+    {
+      "kind": "source",
+      "document_id": "DOCUMENT_ID",
+      "page_index": 0,
+      "text_edits": [
+        {
+          "block_id": "block-3",
+          "runs": [
+            {
+              "span_id": "block-3-line-0-span-1",
+              "text": "Newbold",
+              "overflow_policy": "error"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+```
+
+`overflow_policy` defaults to `error`, preventing silent layout damage. Set it to `shrink` with
+an explicit `minimum_font_scale` when shrinking is acceptable. The export response includes a
+`text_edit_results` entry for every rendered run, reporting the actual font source, whether the
+font was substituted, the effective font size, and whether shrinking occurred. Existing block-
+level `text_edits` remain supported for older clients. A run only requires `span_id` and `text`;
+the source bbox, origin, direction, font, size, color, opacity, style, and measured advance are
+filled from the original PDF. Supply any of those fields only when intentionally overriding that
+specific property.
 
 ## Tests
 

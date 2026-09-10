@@ -5,7 +5,13 @@ from fastapi.responses import FileResponse, Response
 
 from app.config import settings
 from app.dependencies import get_pdf_service, get_storage
-from app.schemas import DocumentMetadata, ExportRequest, ExportResponse, WatermarkMetadata
+from app.schemas import (
+    DocumentMetadata,
+    ExportRequest,
+    ExportResponse,
+    PageContent,
+    WatermarkMetadata,
+)
 from app.services.pdf_service import PdfService
 from app.services.storage import FileStorage, safe_pdf_filename
 
@@ -58,6 +64,52 @@ def page_preview(
         media_type="image/png",
         headers={"Cache-Control": "private, max-age=3600"},
     )
+
+
+@router.get("/documents/{document_id}/pages/{page_index}/edit-background")
+def page_edit_background(
+    document_id: str,
+    page_index: int,
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+    scale: Annotated[float, Query(ge=0.25, le=3)] = 1,
+) -> Response:
+    return Response(
+        content=pdf_service.render_edit_background(document_id, page_index, scale),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.get("/documents/{document_id}/fonts/{font_xref}")
+def document_font(
+    document_id: str,
+    font_xref: int,
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+) -> Response:
+    content, extension = pdf_service.extract_font(document_id, font_xref)
+    media_type = {
+        "otf": "font/otf",
+        "ttf": "font/ttf",
+        "woff": "font/woff",
+        "woff2": "font/woff2",
+    }[extension]
+    return Response(
+        content=content,
+        media_type=media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.get(
+    "/documents/{document_id}/pages/{page_index}/content",
+    response_model=PageContent,
+)
+def page_content(
+    document_id: str,
+    page_index: int,
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+) -> PageContent:
+    return pdf_service.extract_page_content(document_id, page_index)
 
 
 @router.post(
@@ -115,12 +167,16 @@ def create_export(
     pdf_service.validate_sources(request.pages)
     export_id, destination = storage.allocate_export()
     filename = safe_pdf_filename(request.filename, "edited-copy.pdf")
-    pdf_service.compose(request.model_copy(update={"filename": filename}), destination)
+    text_edit_results = pdf_service.compose(
+        request.model_copy(update={"filename": filename}),
+        destination,
+    )
     return ExportResponse(
         id=export_id,
         filename=filename,
         page_count=len(request.pages),
         download_url=f"/api/v1/exports/{export_id}/download?filename={filename}",
+        text_edit_results=text_edit_results,
     )
 
 

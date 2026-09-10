@@ -1,7 +1,7 @@
 [project]
 name = "pdf-editor-api"
 version = "0.1.0"
-description = "Non-destructive coarse-grained PDF editing API"
+description = "Non-destructive layout-aware PDF editing API"
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.116,<1",

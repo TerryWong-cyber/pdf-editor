@@ -29,4 +29,3 @@ def sample_pdf(tmp_path: Path) -> Path:
     document.save(path)
     document.close()
     return path
-

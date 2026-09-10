@@ -2,6 +2,7 @@ from io import BytesIO
 from pathlib import Path
 
 import pymupdf
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
@@ -26,6 +27,406 @@ def test_upload_and_preview(client: TestClient, sample_pdf: Path) -> None:
     assert preview.status_code == 200
     assert preview.headers["content-type"] == "image/png"
     assert preview.content.startswith(b"\x89PNG")
+
+
+def test_extract_and_edit_page_text(client: TestClient, sample_pdf: Path) -> None:
+    document = upload_sample(client, sample_pdf)
+    content_response = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    )
+    assert content_response.status_code == 200, content_response.text
+    content = content_response.json()
+    assert content["layout_version"] == 2
+    assert content["coordinate_space"] == "rotated_page"
+    assert content["width"] == 300
+    block = next(item for item in content["blocks"] if "Sample page 1" in item["text"])
+
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "filename": "text-edit.pdf",
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [
+                        {
+                            "block_id": block["id"],
+                            "bbox": block["bbox"],
+                            "text": "Edited page 1",
+                            "font_size": block["font_size"],
+                            "color": block["color"],
+                            "origin": block["origin"],
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    exported_text = output[0].get_text()
+    output.close()
+    assert "Edited page 1" in exported_text
+    assert "Sample page 1" not in exported_text
+
+
+def test_edit_text_on_natively_rotated_page(client: TestClient, tmp_path: Path) -> None:
+    rotated_path = tmp_path / "rotated.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=300, height=400)
+    page.insert_text((40, 60), "Rotated original", fontsize=16)
+    page.set_rotation(90)
+    source.save(rotated_path)
+    source.close()
+
+    document = upload_sample(client, rotated_path)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    assert content["width"] == 400
+    assert content["height"] == 300
+    block = content["blocks"][0]
+    assert 0 <= block["bbox"]["x0"] < block["bbox"]["x1"] <= 400
+    assert 0 <= block["bbox"]["y0"] < block["bbox"]["y1"] <= 300
+
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [
+                        {
+                            "block_id": block["id"],
+                            "bbox": block["bbox"],
+                            "text": "Rotated edit",
+                            "font_size": block["font_size"],
+                            "color": block["color"],
+                            "origin": block["origin"],
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    assert "Rotated edit" in output[0].get_text()
+    assert "Rotated original" not in output[0].get_text()
+    output.close()
+
+
+def test_edit_background_removes_text_without_white_fill(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "colored-background.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=220, height=140)
+    page.draw_rect(page.rect, color=None, fill=(0.2, 0.6, 0.8))
+    page.insert_text((35, 70), "Background stays blue", fontsize=16, color=(0, 0, 0))
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    preview = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/edit-background"
+    )
+    assert preview.status_code == 200
+    image = Image.open(BytesIO(preview.content)).convert("RGB")
+    expected = image.getpixel((10, 10))
+    text_area = image.crop((30, 45, 200, 75))
+    assert all(
+        max(abs(channel - expected[index]) for index, channel in enumerate(pixel)) <= 2
+        for pixel in text_area.get_flattened_data()
+    )
+
+
+def test_reuses_embedded_font_when_new_glyphs_are_available(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    font_path = next(
+        (
+            candidate
+            for candidate in (
+                Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+                Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+            )
+            if candidate.is_file()
+        ),
+        None,
+    )
+    if font_path is None:
+        pytest.skip("no portable TrueType font available for embedded-font test")
+
+    path = tmp_path / "embedded-font.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=320, height=180)
+    page.insert_text(
+        (40, 70),
+        "Original font",
+        fontname="sourcefont",
+        fontfile=str(font_path),
+        fontsize=19,
+    )
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    block = content["blocks"][0]
+    assert block["font_xref"] is not None
+    assert block["font_url"]
+    font_response = client.get(block["font_url"])
+    assert font_response.status_code == 200
+    assert font_response.headers["content-type"] in {"font/ttf", "font/otf"}
+
+    text_edit = {
+        "block_id": block["id"],
+        "bbox": block["bbox"],
+        "text": "Original edit",
+        "font_size": block["font_size"],
+        "color": block["color"],
+        "font_name": block["font_name"],
+        "font_xref": block["font_xref"],
+        "line_height": block["line_height"],
+        "origin": block["origin"],
+    }
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [text_edit],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    assert "Original edit" in output[0].get_text().replace("\xa0", " ")
+    assert any(font[4] == "OriginalFont0" for font in output[0].get_fonts(full=True))
+    output.close()
+
+
+def test_extracts_and_edits_individual_styled_span(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "mixed-spans.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=360, height=180)
+    page.insert_text((40, 70), "Regular ", fontname="helv", fontsize=16, color=(0, 0, 0))
+    page.insert_text((105, 70), "Red bold", fontname="hebo", fontsize=16, color=(1, 0, 0))
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content_response = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    )
+    assert content_response.status_code == 200, content_response.text
+    block = content_response.json()["blocks"][0]
+    assert len(block["lines"]) == 1
+    line = block["lines"][0]
+    assert line["text"] == "Regular Red bold"
+    assert len(line["spans"]) == 2
+    red_span = line["spans"][1]
+    assert red_span["text"] == "Red bold"
+    assert red_span["font_name"] == "Helvetica-Bold"
+    assert red_span["font_weight"] == 700
+    assert red_span["color"] == "#ff0000"
+    assert red_span["advance"] > 0
+    assert "".join(character["text"] for character in red_span["characters"]) == "Red bold"
+    assert all(
+        character["bbox"]["x1"] > character["bbox"]["x0"]
+        for character in red_span["characters"]
+    )
+
+    run = {
+        "span_id": red_span["id"],
+        "text": "Newbold",
+    }
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "filename": "span-edit.pdf",
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [{"block_id": block["id"], "runs": [run]}],
+                }
+            ],
+        },
+    )
+    assert export.status_code == 201, export.text
+    edit_result = export.json()["text_edit_results"][0]
+    assert edit_result["span_id"] == red_span["id"]
+    assert edit_result["font_source"] == "builtin"
+    assert edit_result["font_substituted"] is False
+    assert edit_result["effective_font_size"] == 16
+    assert edit_result["overflow_action"] == "none"
+
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    output_text = output[0].get_text()
+    assert "Regular" in output_text
+    assert "Newbold" in output_text
+    assert "Red bold" not in output_text
+    replacement = next(
+        span
+        for block_data in output[0].get_text("dict")["blocks"]
+        for line_data in block_data.get("lines", [])
+        for span in line_data.get("spans", [])
+        if "Newbold" in span["text"]
+    )
+    assert replacement["font"] == "Helvetica-Bold"
+    assert replacement["color"] == 0xFF0000
+    assert replacement["size"] == pytest.approx(16, abs=0.05)
+    output.close()
+
+
+def test_span_edit_reports_overflow_and_can_explicitly_shrink(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "span-overflow.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=260, height=140)
+    page.insert_text((30, 65), "Short text", fontname="helv", fontsize=14)
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    block = content["blocks"][0]
+    line = block["lines"][0]
+    span = line["spans"][0]
+    base_run = {
+        "span_id": span["id"],
+        "text": "Some longer text",
+    }
+    page_spec = {
+        "kind": "source",
+        "document_id": document["id"],
+        "page_index": 0,
+        "text_edits": [{"block_id": block["id"], "runs": [base_run]}],
+    }
+
+    unknown_span = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    **page_spec,
+                    "text_edits": [
+                        {
+                            "block_id": block["id"],
+                            "runs": [{**base_run, "span_id": "missing-span"}],
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert unknown_span.status_code == 422
+    assert "does not belong" in unknown_span.json()["detail"]
+
+    rejected = client.post("/api/v1/exports", json={"pages": [page_spec]})
+    assert rejected.status_code == 422
+    assert "does not fit" in rejected.json()["detail"]
+
+    base_run["overflow_policy"] = "shrink"
+    base_run["minimum_font_scale"] = 0.5
+    accepted = client.post("/api/v1/exports", json={"pages": [page_spec]})
+    assert accepted.status_code == 201, accepted.text
+    result = accepted.json()["text_edit_results"][0]
+    assert result["overflow_action"] == "shrink"
+    assert 7 <= result["effective_font_size"] < 14
+
+
+def test_span_edit_preserves_arbitrary_text_direction(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "angled-text.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=320, height=260)
+    origin = pymupdf.Point(100, 160)
+    page.insert_text(
+        origin,
+        "Angle",
+        fontname="helv",
+        fontsize=18,
+        morph=(origin, pymupdf.Matrix(30)),
+    )
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    block = content["blocks"][0]
+    line = block["lines"][0]
+    span = line["spans"][0]
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [
+                        {
+                            "block_id": block["id"],
+                            "runs": [
+                                {
+                                    "span_id": span["id"],
+                                    "text": "Slope",
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    output_line = next(
+        line_data
+        for block_data in output[0].get_text("rawdict")["blocks"]
+        for line_data in block_data.get("lines", [])
+        if "Slope"
+        in "".join(
+            character["c"]
+            for span_data in line_data.get("spans", [])
+            for character in span_data.get("chars", [])
+        )
+    )
+    assert output_line["dir"][0] == pytest.approx(line["direction"]["x"], abs=0.001)
+    assert output_line["dir"][1] == pytest.approx(line["direction"]["y"], abs=0.001)
+    output.close()
 
 
 def test_compose_copy_reorder_rotate_crop_and_blank(client: TestClient, sample_pdf: Path) -> None:

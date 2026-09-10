@@ -1,6 +1,7 @@
 from functools import lru_cache
 
 from app.config import settings
+from app.services.font_resolver import FontResolver
 from app.services.pdf_service import PdfService
 from app.services.storage import FileStorage
 
@@ -11,5 +12,4 @@ def get_storage() -> FileStorage:
 
 
 def get_pdf_service() -> PdfService:
-    return PdfService(get_storage())
-
+    return PdfService(get_storage(), FontResolver(settings))

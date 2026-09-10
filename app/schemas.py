@@ -39,6 +39,168 @@ class WatermarkSpec(BaseModel):
     y: Annotated[float, Field(ge=0, le=1)] = 0.5
 
 
+class PdfRect(BaseModel):
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+
+    @model_validator(mode="after")
+    def validate_area(self) -> "PdfRect":
+        if self.x1 < self.x0 or self.y1 < self.y0:
+            raise ValueError("PDF rectangle coordinates must be ordered")
+        return self
+
+    @property
+    def has_positive_area(self) -> bool:
+        return self.x1 > self.x0 and self.y1 > self.y0
+
+
+class PdfPoint(BaseModel):
+    x: float
+    y: float
+
+
+class TextCharacter(BaseModel):
+    index: int
+    text: str
+    bbox: PdfRect
+    origin: PdfPoint
+    synthetic: bool = False
+
+
+class TextSpan(BaseModel):
+    id: str
+    text: str
+    bbox: PdfRect
+    origin: PdfPoint
+    advance: Annotated[float, Field(ge=0)]
+    font_size: Annotated[float, Field(gt=0, le=512)]
+    font_name: str
+    font_xref: int | None = None
+    font_xref_candidates: list[int] = Field(default_factory=list)
+    font_url: str | None = None
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    alpha: Annotated[int, Field(ge=0, le=255)] = 255
+    flags: int = 0
+    char_flags: int = 0
+    bidi: int = 0
+    font_weight: Literal[400, 700] = 400
+    italic: bool = False
+    serif: bool = False
+    monospace: bool = False
+    superscript: bool = False
+    ascender: float
+    descender: float
+    characters: list[TextCharacter] = Field(default_factory=list)
+
+
+class TextLine(BaseModel):
+    id: str
+    text: str
+    bbox: PdfRect
+    direction: PdfPoint
+    writing_mode: Literal[0, 1] = 0
+    spans: list[TextSpan] = Field(default_factory=list)
+
+
+class TextBlock(BaseModel):
+    id: str
+    bbox: PdfRect
+    text: str
+    font_size: Annotated[float, Field(gt=0, le=512)]
+    color: str = Field(pattern=r"^#[0-9a-fA-F]{6}$")
+    font_name: str = "sans-serif"
+    font_xref: int | None = None
+    font_url: str | None = None
+    font_weight: Literal[400, 700] = 400
+    italic: bool = False
+    line_height: Annotated[float, Field(ge=0.7, le=4)] = 1.2
+    origin: PdfPoint
+    lines: list[TextLine] = Field(default_factory=list)
+
+
+class PageContent(BaseModel):
+    layout_version: Literal[2] = 2
+    coordinate_space: Literal["rotated_page"] = "rotated_page"
+    document_id: str
+    page_index: int
+    width: float
+    height: float
+    blocks: list[TextBlock]
+
+
+class TextRunEdit(BaseModel):
+    span_id: str = Field(min_length=1, max_length=120)
+    text: str = Field(max_length=20_000)
+    bbox: PdfRect | None = None
+    font_size: Annotated[float, Field(gt=0, le=512)] | None = None
+    color: Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")] | None = None
+    alpha: Annotated[int, Field(ge=0, le=255)] | None = None
+    font_name: Annotated[str, Field(max_length=200)] | None = None
+    font_xref: int | None = Field(default=None, ge=1)
+    font_weight: Literal[400, 700] | None = None
+    italic: bool | None = None
+    origin: PdfPoint | None = None
+    direction: PdfPoint | None = None
+    writing_mode: Literal[0, 1] | None = None
+    source_advance: Annotated[float, Field(gt=0)] | None = None
+    render_mode: Annotated[int, Field(ge=0, le=3)] = 0
+    overflow_policy: Literal["error", "shrink"] = "error"
+    minimum_font_scale: Annotated[float, Field(ge=0.5, le=1)] = 0.75
+
+    @model_validator(mode="after")
+    def validate_run(self) -> "TextRunEdit":
+        if self.bbox is not None and not self.bbox.has_positive_area:
+            raise ValueError("span text box must have a positive area")
+        if "\n" in self.text or "\r" in self.text:
+            raise ValueError("span text must stay on one line; submit one run per output line")
+        if self.direction is not None and (
+            abs(self.direction.x) < 1e-9 and abs(self.direction.y) < 1e-9
+        ):
+            raise ValueError("text direction must be a non-zero vector")
+        if self.writing_mode not in (None, 0):
+            raise ValueError("vertical writing mode is not supported for span replacement")
+        return self
+
+
+class TextEdit(BaseModel):
+    block_id: str = Field(min_length=1, max_length=80)
+    bbox: PdfRect | None = None
+    text: Annotated[str, Field(max_length=100_000)] | None = None
+    font_size: Annotated[float, Field(gt=0, le=512)] | None = None
+    color: str = Field(default="#000000", pattern=r"^#[0-9a-fA-F]{6}$")
+    alpha: Annotated[int, Field(ge=0, le=255)] = 255
+    font_name: str = Field(default="sans-serif", max_length=200)
+    font_xref: int | None = Field(default=None, ge=1)
+    font_weight: Literal[400, 700] = 400
+    italic: bool = False
+    line_height: Annotated[float, Field(ge=0.7, le=4)] = 1.2
+    origin: PdfPoint | None = None
+    overflow_policy: Literal["error", "shrink"] = "shrink"
+    minimum_font_scale: Annotated[float, Field(ge=0.5, le=1)] = 0.55
+    runs: list[TextRunEdit] = Field(default_factory=list, max_length=2_000)
+
+    @model_validator(mode="after")
+    def validate_edit_mode(self) -> "TextEdit":
+        if self.runs:
+            return self
+        missing = [
+            name
+            for name, value in (
+                ("bbox", self.bbox),
+                ("text", self.text),
+                ("font_size", self.font_size),
+            )
+            if value is None
+        ]
+        if missing:
+            raise ValueError(f"legacy text edit is missing: {', '.join(missing)}")
+        if self.bbox is not None and not self.bbox.has_positive_area:
+            raise ValueError("text box must have a positive area")
+        return self
+
+
 class SourcePage(BaseModel):
     kind: Literal["source"]
     document_id: str
@@ -46,6 +208,7 @@ class SourcePage(BaseModel):
     rotation: Literal[0, 90, 180, 270] = 0
     crop: CropBox | None = None
     watermark: WatermarkSpec | None = None
+    text_edits: list[TextEdit] = Field(default_factory=list, max_length=500)
 
 
 class BlankPage(BaseModel):
@@ -64,11 +227,25 @@ class ExportRequest(BaseModel):
     pages: list[PageSpec] = Field(min_length=1, max_length=2000)
 
 
+class TextEditResult(BaseModel):
+    page_index: int
+    block_id: str
+    span_id: str | None = None
+    requested_font_name: str
+    resolved_font_name: str
+    font_source: Literal["embedded", "configured", "builtin"]
+    font_substituted: bool
+    requested_font_size: float
+    effective_font_size: float
+    overflow_action: Literal["none", "shrink"] = "none"
+
+
 class ExportResponse(BaseModel):
     id: str
     filename: str
     page_count: int
     download_url: str
+    text_edit_results: list[TextEditResult] = Field(default_factory=list)
 
 
 class WatermarkMetadata(BaseModel):
