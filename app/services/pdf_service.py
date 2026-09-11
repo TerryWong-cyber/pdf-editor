@@ -26,6 +26,7 @@ from app.schemas import (
     TextLine,
     TextRunEdit,
     TextSpan,
+    TextStyleSegment,
     WatermarkMetadata,
     WatermarkSpec,
 )
@@ -54,6 +55,55 @@ class PdfService:
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail="invalid, damaged, or password-protected PDF",
             ) from exc
+
+    @staticmethod
+    def _rotate_image_for_rect(
+        image_bytes: bytes,
+        rect: pymupdf.Rect,
+        rotation: float,
+    ) -> tuple[bytes, pymupdf.Rect]:
+        """Stretch to the page box, then rotate the pixels around its center."""
+        if abs(rotation) <= 0.01:
+            return image_bytes, rect
+        try:
+            with Image.open(BytesIO(image_bytes)) as source:
+                width_points = max(1.0, abs(rect.width))
+                height_points = max(1.0, abs(rect.height))
+                density = max(
+                    2.0,
+                    min(4.0, source.width / width_points, source.height / height_points),
+                )
+                density = min(density, 8192 / max(width_points, height_points))
+                stretched = source.convert("RGBA").resize(
+                    (
+                        max(1, round(width_points * density)),
+                        max(1, round(height_points * density)),
+                    ),
+                    Image.Resampling.LANCZOS,
+                )
+                rotated = stretched.rotate(
+                    -rotation,
+                    resample=Image.Resampling.BICUBIC,
+                    expand=True,
+                )
+                output = BytesIO()
+                rotated.save(output, format="PNG")
+        except (UnidentifiedImageError, OSError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="edited image cannot be rotated",
+            ) from exc
+
+        angle = radians(rotation)
+        rotated_width = abs(rect.width * cos(angle)) + abs(rect.height * sin(angle))
+        rotated_height = abs(rect.width * sin(angle)) + abs(rect.height * cos(angle))
+        center = (rect.tl + rect.br) / 2
+        return output.getvalue(), pymupdf.Rect(
+            center.x - rotated_width / 2,
+            center.y - rotated_height / 2,
+            center.x + rotated_width / 2,
+            center.y + rotated_height / 2,
+        )
 
     def inspect(self, document_id: str, path: Path, filename: str) -> DocumentMetadata:
         with self._open_pdf(path) as document:
@@ -656,6 +706,16 @@ class PdfService:
     ) -> TextEditResult | None:
         if not run.text:
             return None
+        if run.segments:
+            return self._write_rich_text_run(
+                source,
+                page,
+                page_index,
+                block_id,
+                run,
+                rect,
+                slot,
+            )
         assert run.bbox is not None
         assert run.font_size is not None
         assert run.color is not None
@@ -725,6 +785,156 @@ class PdfService:
             font_substituted=font.substituted,
             requested_font_size=round(run.font_size, 3),
             effective_font_size=round(effective_font_size, 3),
+            overflow_action=overflow_action,
+        )
+
+    def _write_rich_text_run(
+        self,
+        source: pymupdf.Document,
+        page: pymupdf.Page,
+        page_index: int,
+        block_id: str,
+        run: TextRunEdit,
+        rect: pymupdf.Rect,
+        slot: int,
+    ) -> TextEditResult:
+        assert run.font_size is not None
+        assert run.color is not None
+        assert run.alpha is not None
+        assert run.font_name is not None
+        assert run.font_weight is not None
+        assert run.italic is not None
+        assert run.origin is not None
+        assert run.direction is not None
+        prepared: list[
+            tuple[TextStyleSegment, ResolvedFont, float, float, tuple[float, float, float]]
+        ] = []
+        requested_length = 0.0
+        for index, segment in enumerate(run.segments):
+            if not segment.text:
+                continue
+            font_size = segment.font_size or run.font_size
+            rendered_size = font_size * (0.68 if segment.script != "normal" else 1)
+            font_name = segment.font_name or run.font_name
+            font_weight = segment.font_weight or run.font_weight
+            italic = segment.italic if segment.italic is not None else run.italic
+            font_xref = (
+                segment.font_xref
+                if "font_xref" in segment.model_fields_set
+                else run.font_xref
+            )
+            font = self._resolve_edit_font(
+                source,
+                page_index,
+                segment.text,
+                font_xref,
+                font_name,
+                font_weight,
+                italic,
+                slot * 2_000 + index,
+            )
+            self._register_font(page, font)
+            width = self._font_metrics(font).text_length(segment.text, fontsize=rendered_size)
+            requested_length += width
+            prepared.append(
+                (
+                    segment,
+                    font,
+                    rendered_size,
+                    width,
+                    self._pdf_color(segment.color or run.color),
+                )
+            )
+
+        available_length = run.source_advance or rect.width
+        effective_scale = 1.0
+        overflow_action = "none"
+        tolerance = max(1.5, run.font_size * 0.08)
+        if requested_length > available_length + tolerance:
+            effective_scale = available_length / requested_length
+            if run.overflow_policy == "error" or effective_scale < run.minimum_font_scale:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                    detail=(
+                        f"edited text does not fit in {run.span_id}: requires "
+                        f"{requested_length:.2f}pt, available {available_length:.2f}pt"
+                    ),
+                )
+            overflow_action = "shrink"
+
+        direction = self._source_direction(page, run.direction)
+        perpendicular = pymupdf.Point(-direction.y, direction.x)
+        cursor = self._source_point(page, run.origin)
+        angle = -degrees(atan2(direction.y, direction.x))
+        for segment, font, requested_size, requested_width, color in prepared:
+            font_size = requested_size * effective_scale
+            advance = requested_width * effective_scale
+            script_shift = 0.0
+            if segment.script == "superscript":
+                script_shift = -font_size * 0.48
+            elif segment.script == "subscript":
+                script_shift = font_size * 0.25
+            baseline = cursor + perpendicular * script_shift
+            end = baseline + direction * advance
+            if segment.highlight_color:
+                upper = baseline - perpendicular * font_size * 0.88
+                lower = baseline + perpendicular * font_size * 0.24
+                page.draw_quad(
+                    pymupdf.Quad(
+                        upper,
+                        upper + direction * advance,
+                        lower,
+                        lower + direction * advance,
+                    ),
+                    color=None,
+                    fill=self._pdf_color(segment.highlight_color),
+                    overlay=True,
+                )
+            morph = None if abs(angle) <= 0.01 else (baseline, pymupdf.Matrix(angle))
+            page.insert_text(
+                baseline,
+                segment.text,
+                fontname=font.name,
+                fontfile=str(font.path) if font.path else None,
+                fontsize=font_size,
+                color=color,
+                fill_opacity=(segment.alpha if segment.alpha is not None else run.alpha) / 255,
+                stroke_opacity=(segment.alpha if segment.alpha is not None else run.alpha) / 255,
+                render_mode=run.render_mode,
+                morph=morph,
+            )
+            line_width = max(0.45, font_size * 0.045)
+            if segment.underline:
+                offset = perpendicular * font_size * 0.1
+                page.draw_line(
+                    baseline + offset,
+                    end + offset,
+                    color=color,
+                    width=line_width,
+                    overlay=True,
+                )
+            if segment.strikethrough:
+                offset = perpendicular * -font_size * 0.32
+                page.draw_line(
+                    baseline + offset,
+                    end + offset,
+                    color=color,
+                    width=line_width,
+                    overlay=True,
+                )
+            cursor += direction * advance
+
+        first_font = prepared[0][1]
+        return TextEditResult(
+            page_index=page_index,
+            block_id=block_id,
+            span_id=run.span_id,
+            requested_font_name=run.font_name,
+            resolved_font_name=first_font.name,
+            font_source=first_font.source,
+            font_substituted=any(font.substituted for _, font, _, _, _ in prepared),
+            requested_font_size=round(run.font_size, 3),
+            effective_font_size=round(run.font_size * effective_scale, 3),
             overflow_action=overflow_action,
         )
 
@@ -938,8 +1148,13 @@ class PdfService:
                     if image_edit.asset_id is not None
                     else self._pixmap_png(source, source_page, image_info)
                 )
-                page.insert_image(
+                image_bytes, insert_rect = self._rotate_image_for_rect(
+                    image_bytes,
                     target_rect,
+                    image_edit.rotation,
+                )
+                page.insert_image(
+                    insert_rect,
                     stream=image_bytes,
                     keep_proportion=False,
                     overlay=True,

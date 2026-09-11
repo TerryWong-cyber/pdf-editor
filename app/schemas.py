@@ -143,6 +143,27 @@ class PageContent(BaseModel):
     images: list[ImageBlock] = Field(default_factory=list)
 
 
+class TextStyleSegment(BaseModel):
+    text: str = Field(max_length=20_000)
+    font_size: Annotated[float, Field(gt=0, le=512)] | None = None
+    color: Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")] | None = None
+    alpha: Annotated[int, Field(ge=0, le=255)] | None = None
+    font_name: Annotated[str, Field(max_length=200)] | None = None
+    font_xref: int | None = Field(default=None, ge=1)
+    font_weight: Literal[400, 700] | None = None
+    italic: bool | None = None
+    underline: bool = False
+    strikethrough: bool = False
+    script: Literal["normal", "superscript", "subscript"] = "normal"
+    highlight_color: Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")] | None = None
+
+    @model_validator(mode="after")
+    def validate_segment(self) -> "TextStyleSegment":
+        if "\n" in self.text or "\r" in self.text:
+            raise ValueError("styled text segment must stay on one line")
+        return self
+
+
 class TextRunEdit(BaseModel):
     span_id: str = Field(min_length=1, max_length=120)
     text: str = Field(max_length=20_000)
@@ -161,6 +182,7 @@ class TextRunEdit(BaseModel):
     render_mode: Annotated[int, Field(ge=0, le=3)] = 0
     overflow_policy: Literal["error", "shrink"] = "error"
     minimum_font_scale: Annotated[float, Field(ge=0.5, le=1)] = 0.75
+    segments: list[TextStyleSegment] = Field(default_factory=list, max_length=2_000)
 
     @model_validator(mode="after")
     def validate_run(self) -> "TextRunEdit":
@@ -174,6 +196,8 @@ class TextRunEdit(BaseModel):
             raise ValueError("text direction must be a non-zero vector")
         if self.writing_mode not in (None, 0):
             raise ValueError("vertical writing mode is not supported for span replacement")
+        if self.segments and "".join(segment.text for segment in self.segments) != self.text:
+            raise ValueError("styled text segments must concatenate to the run text")
         return self
 
 
@@ -219,6 +243,7 @@ class ImageEdit(BaseModel):
     action: Literal["delete", "replace"]
     bbox: PdfRect | None = None
     asset_id: str | None = None
+    rotation: Annotated[float, Field(ge=-180, le=180)] = 0
 
     @model_validator(mode="after")
     def validate_edit(self) -> "ImageEdit":

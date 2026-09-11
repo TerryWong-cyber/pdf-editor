@@ -214,6 +214,35 @@ def test_extracts_previews_moves_replaces_and_deletes_page_images(
     moved_target = moved_render.getpixel((180, 75))
     assert moved_target[0] > 200 and moved_target[1] < 60
 
+    rotated = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "image_edits": [
+                        {
+                            "image_id": image["id"],
+                            "action": "replace",
+                            "bbox": {"x0": 150, "y0": 55, "x1": 210, "y1": 95},
+                            "rotation": 45,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert rotated.status_code == 201, rotated.text
+    rotated_pdf = client.get(rotated.json()["download_url"])
+    output = pymupdf.open(stream=rotated_pdf.content, filetype="pdf")
+    rotated_render = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    rotated_center = rotated_render.getpixel((180, 50))
+    assert rotated_center[0] > 180 and rotated_center[1] < 100
+    assert all(channel > 240 for channel in rotated_render.getpixel((60, 70)))
+
     blue = BytesIO()
     Image.new("RGBA", (80, 50), (20, 70, 230, 255)).save(blue, "PNG")
     upload = client.post(
@@ -477,6 +506,85 @@ def test_extracts_and_edits_individual_styled_span(
     assert replacement["color"] == 0xFF0000
     assert replacement["size"] == pytest.approx(16, abs=0.05)
     output.close()
+
+
+def test_exports_rich_text_segments_with_inline_formatting(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "rich-text.pdf"
+    source = pymupdf.open()
+    page = source.new_page(width=360, height=180)
+    page.insert_text((40, 80), "Rich text 2", fontname="helv", fontsize=18)
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    block = content["blocks"][0]
+    span = block["lines"][0]["spans"][0]
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [
+                        {
+                            "block_id": block["id"],
+                            "runs": [
+                                {
+                                    "span_id": span["id"],
+                                    "text": "Rich text 2",
+                                    "overflow_policy": "shrink",
+                                    "minimum_font_scale": 0.55,
+                                    "segments": [
+                                        {
+                                            "text": "Rich",
+                                            "font_name": "Helvetica",
+                                            "font_xref": None,
+                                            "font_weight": 700,
+                                            "color": "#d12222",
+                                            "underline": True,
+                                            "highlight_color": "#fff176",
+                                        },
+                                        {"text": " text ", "italic": True},
+                                        {
+                                            "text": "2",
+                                            "script": "superscript",
+                                            "strikethrough": True,
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    assert "Rich text 2" in output[0].get_text().replace("\n", " ")
+    spans = [
+        item
+        for block_data in output[0].get_text("dict")["blocks"]
+        for line_data in block_data.get("lines", [])
+        for item in line_data.get("spans", [])
+    ]
+    assert any(item["text"] == "Rich" and item["color"] == 0xD12222 for item in spans)
+    assert any("2" in item["text"] and item["size"] < 18 for item in spans)
+    rendered = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    assert any(
+        red > 230 and green > 210 and blue < 160
+        for red, green, blue in rendered.get_flattened_data()
+    )
 
 
 def test_span_edit_reports_overflow_and_can_explicitly_shrink(
