@@ -120,6 +120,18 @@ class TextBlock(BaseModel):
     lines: list[TextLine] = Field(default_factory=list)
 
 
+class ImageBlock(BaseModel):
+    id: str
+    bbox: PdfRect
+    width: Annotated[int, Field(gt=0)]
+    height: Annotated[int, Field(gt=0)]
+    xref: int | None = None
+    bits_per_component: Annotated[int, Field(ge=0)] = 0
+    colorspace: str = ""
+    has_mask: bool = False
+    preview_url: str
+
+
 class PageContent(BaseModel):
     layout_version: Literal[2] = 2
     coordinate_space: Literal["rotated_page"] = "rotated_page"
@@ -128,6 +140,7 @@ class PageContent(BaseModel):
     width: float
     height: float
     blocks: list[TextBlock]
+    images: list[ImageBlock] = Field(default_factory=list)
 
 
 class TextRunEdit(BaseModel):
@@ -201,6 +214,21 @@ class TextEdit(BaseModel):
         return self
 
 
+class ImageEdit(BaseModel):
+    image_id: str = Field(pattern=r"^image-\d+$")
+    action: Literal["delete", "replace"]
+    bbox: PdfRect | None = None
+    asset_id: str | None = None
+
+    @model_validator(mode="after")
+    def validate_edit(self) -> "ImageEdit":
+        if self.bbox is not None and not self.bbox.has_positive_area:
+            raise ValueError("image box must have a positive area")
+        if self.action == "delete" and self.asset_id is not None:
+            raise ValueError("deleted images cannot include an asset_id")
+        return self
+
+
 class SourcePage(BaseModel):
     kind: Literal["source"]
     document_id: str
@@ -209,6 +237,7 @@ class SourcePage(BaseModel):
     crop: CropBox | None = None
     watermark: WatermarkSpec | None = None
     text_edits: list[TextEdit] = Field(default_factory=list, max_length=500)
+    image_edits: list[ImageEdit] = Field(default_factory=list, max_length=500)
 
 
 class BlankPage(BaseModel):
@@ -249,6 +278,14 @@ class ExportResponse(BaseModel):
 
 
 class WatermarkMetadata(BaseModel):
+    id: str
+    filename: str
+    width: int
+    height: int
+    preview_url: str
+
+
+class ImageAssetMetadata(BaseModel):
     id: str
     filename: str
     width: int

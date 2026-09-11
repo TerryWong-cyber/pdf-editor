@@ -6,6 +6,8 @@ import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
+from app.services.pdf_service import PdfService
+
 
 def upload_sample(client: TestClient, sample_pdf: Path) -> dict:
     with sample_pdf.open("rb") as stream:
@@ -15,6 +17,10 @@ def upload_sample(client: TestClient, sample_pdf: Path) -> dict:
         )
     assert response.status_code == 201
     return response.json()[0]
+
+
+def test_font_key_normalizes_linux_dejavu_book_style() -> None:
+    assert PdfService._font_key("DejaVu Sans Book") == PdfService._font_key("DejaVuSans")
 
 
 def test_upload_and_preview(client: TestClient, sample_pdf: Path) -> None:
@@ -146,6 +152,178 @@ def test_edit_background_removes_text_without_white_fill(
         max(abs(channel - expected[index]) for index, channel in enumerate(pixel)) <= 2
         for pixel in text_area.get_flattened_data()
     )
+
+
+def test_extracts_previews_moves_replaces_and_deletes_page_images(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "page-image.pdf"
+    red = BytesIO()
+    Image.new("RGB", (60, 40), (230, 25, 25)).save(red, "PNG")
+    source = pymupdf.open()
+    page = source.new_page(width=260, height=160)
+    page.insert_image(pymupdf.Rect(30, 50, 90, 90), stream=red.getvalue())
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content_response = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    )
+    assert content_response.status_code == 200, content_response.text
+    image = content_response.json()["images"][0]
+    assert image["id"] == "image-0"
+    assert image["bbox"] == {"x0": 30.0, "y0": 50.0, "x1": 90.0, "y1": 90.0}
+    image_preview = client.get(image["preview_url"])
+    assert image_preview.status_code == 200
+    assert image_preview.content.startswith(b"\x89PNG")
+
+    clean_background = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/edit-background",
+        params={"remove_text": "false", "remove_images": "true"},
+    )
+    clean_image = Image.open(BytesIO(clean_background.content)).convert("RGB")
+    assert all(channel > 240 for channel in clean_image.getpixel((60, 70)))
+
+    moved = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "image_edits": [
+                        {
+                            "image_id": image["id"],
+                            "action": "replace",
+                            "bbox": {"x0": 150, "y0": 55, "x1": 210, "y1": 95},
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert moved.status_code == 201, moved.text
+    moved_pdf = client.get(moved.json()["download_url"])
+    output = pymupdf.open(stream=moved_pdf.content, filetype="pdf")
+    moved_render = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    assert all(channel > 240 for channel in moved_render.getpixel((60, 70)))
+    moved_target = moved_render.getpixel((180, 75))
+    assert moved_target[0] > 200 and moved_target[1] < 60
+
+    blue = BytesIO()
+    Image.new("RGBA", (80, 50), (20, 70, 230, 255)).save(blue, "PNG")
+    upload = client.post(
+        "/api/v1/images",
+        files={"file": ("edited.png", blue.getvalue(), "image/png")},
+    )
+    assert upload.status_code == 201, upload.text
+    asset = upload.json()
+    assert asset["width"] == 80
+    assert client.get(asset["preview_url"]).status_code == 200
+
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "image_edits": [
+                        {
+                            "image_id": image["id"],
+                            "action": "replace",
+                            "asset_id": asset["id"],
+                            "bbox": {"x0": 150, "y0": 55, "x1": 230, "y1": 105},
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    rendered = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    assert all(channel > 240 for channel in rendered.getpixel((60, 70)))
+    target = rendered.getpixel((190, 80))
+    assert target[2] > 200 and target[0] < 60
+
+    deleted = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "image_edits": [{"image_id": image["id"], "action": "delete"}],
+                }
+            ]
+        },
+    )
+    assert deleted.status_code == 201, deleted.text
+    deleted_pdf = client.get(deleted.json()["download_url"])
+    output = pymupdf.open(stream=deleted_pdf.content, filetype="pdf")
+    rendered = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    assert all(channel > 240 for channel in rendered.getpixel((60, 70)))
+
+
+def test_moves_text_span_using_target_bbox_and_origin(
+    client: TestClient,
+    sample_pdf: Path,
+) -> None:
+    document = upload_sample(client, sample_pdf)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    block = content["blocks"][0]
+    span = block["lines"][0]["spans"][0]
+    dx, dy = 90, 75
+    moved_bbox = {
+        key: value + (dx if key.startswith("x") else dy)
+        for key, value in span["bbox"].items()
+    }
+    moved_origin = {"x": span["origin"]["x"] + dx, "y": span["origin"]["y"] + dy}
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [
+                        {
+                            "block_id": block["id"],
+                            "runs": [
+                                {
+                                    "span_id": span["id"],
+                                    "text": span["text"],
+                                    "bbox": moved_bbox,
+                                    "origin": moved_origin,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    words = output[0].get_text("words")
+    output.close()
+    sample = next(word for word in words if word[4] == "Sample")
+    assert sample[0] > 120
+    assert sample[1] > 110
 
 
 def test_reuses_embedded_font_when_new_glyphs_are_available(

@@ -9,6 +9,7 @@ from app.schemas import (
     DocumentMetadata,
     ExportRequest,
     ExportResponse,
+    ImageAssetMetadata,
     PageContent,
     WatermarkMetadata,
 )
@@ -18,6 +19,8 @@ from app.services.storage import FileStorage, safe_pdf_filename
 router = APIRouter()
 WATERMARK_MAX_BYTES = 20 * 1024 * 1024
 WATERMARK_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
+IMAGE_MAX_BYTES = 30 * 1024 * 1024
+IMAGE_CONTENT_TYPES = {"image/png", "image/jpeg", "image/webp"}
 
 
 @router.post(
@@ -72,9 +75,17 @@ def page_edit_background(
     page_index: int,
     pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
     scale: Annotated[float, Query(ge=0.25, le=3)] = 1,
+    remove_text: bool = True,
+    remove_images: bool = False,
 ) -> Response:
     return Response(
-        content=pdf_service.render_edit_background(document_id, page_index, scale),
+        content=pdf_service.render_edit_background(
+            document_id,
+            page_index,
+            scale,
+            remove_text=remove_text,
+            remove_images=remove_images,
+        ),
         media_type="image/png",
         headers={"Cache-Control": "private, max-age=3600"},
     )
@@ -110,6 +121,20 @@ def page_content(
     pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
 ) -> PageContent:
     return pdf_service.extract_page_content(document_id, page_index)
+
+
+@router.get("/documents/{document_id}/pages/{page_index}/images/{image_id}/preview")
+def document_image_preview(
+    document_id: str,
+    page_index: int,
+    image_id: str,
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+) -> Response:
+    return Response(
+        content=pdf_service.extract_page_image(document_id, page_index, image_id),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
 
 
 @router.post(
@@ -153,6 +178,52 @@ def watermark_preview(
 ) -> FileResponse:
     return FileResponse(
         storage.watermark_path(watermark_id),
+        media_type="image/png",
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.post(
+    "/images",
+    response_model=ImageAssetMetadata,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_image(
+    file: Annotated[UploadFile, File(description="Processed PNG, JPEG, or WebP image")],
+    storage: Annotated[FileStorage, Depends(get_storage)],
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+) -> ImageAssetMetadata:
+    if file.content_type not in IMAGE_CONTENT_TYPES:
+        await file.close()
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="image only supports PNG, JPEG, and WebP files",
+        )
+    if file.size is not None and file.size > IMAGE_MAX_BYTES:
+        await file.close()
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="image exceeds 30 MB limit",
+        )
+    content = await file.read(IMAGE_MAX_BYTES + 1)
+    filename = file.filename or "image"
+    await file.close()
+    if len(content) > IMAGE_MAX_BYTES:
+        raise HTTPException(
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+            detail="image exceeds 30 MB limit",
+        )
+    image_id, destination = storage.allocate_image()
+    return pdf_service.create_image_asset(content, filename, destination, image_id)
+
+
+@router.get("/images/{image_id}/preview")
+def image_preview(
+    image_id: str,
+    storage: Annotated[FileStorage, Depends(get_storage)],
+) -> FileResponse:
+    return FileResponse(
+        storage.image_path(image_id),
         media_type="image/png",
         headers={"Cache-Control": "private, max-age=3600"},
     )

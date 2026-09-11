@@ -20,8 +20,11 @@ frontend development by default.
 - `POST /api/v1/documents`: upload one or more PDFs. Multiple files are appended in upload order.
 - `GET /api/v1/documents/{id}/pages/{page}/preview`: render a page thumbnail.
 - `GET /api/v1/documents/{id}/pages/{page}/edit-background`: render the page background with text removed.
-- `GET /api/v1/documents/{id}/pages/{page}/content`: parse blocks, lines, styled spans, and
-  character-level geometry.
+- `GET /api/v1/documents/{id}/pages/{page}/content`: parse text blocks, styled spans,
+  character geometry, and editable image regions.
+- `GET /api/v1/documents/{id}/pages/{page}/images/{image_id}/preview`: return a PNG source
+  for the image editor.
+- `POST /api/v1/images`: normalize a processed PNG, JPEG, or WebP image before insertion.
 - `GET /api/v1/documents/{id}/fonts/{xref}`: serve a browser-compatible embedded font.
 - `POST /api/v1/watermarks`: upload and normalize a PNG, JPEG, or WebP watermark image.
 - `POST /api/v1/exports`: compose arbitrary source pages and blank pages into a new PDF.
@@ -30,9 +33,10 @@ frontend development by default.
 Delete, copy, reorder, extract, merge, rotate, crop, and blank-page creation all map to the
 ordered `pages` array accepted by the export endpoint. Each page can also carry a watermark
 configuration with arbitrary rotation, page-relative scale, opacity, and normalized position.
-Source pages may additionally carry `text_edits`; export redacts only those original text boxes
-and writes their replacement text into the new copy. Multilingual output selects the configured
-Noto font by script. The server paths are listed in `.env.example`.
+Source pages may additionally carry `text_edits` and `image_edits`; export redacts only the
+changed original regions and writes moved text or deleted/replaced images into the new copy.
+Multilingual output selects the configured Noto font by script. The server paths are listed in
+`.env.example`.
 When the source PDF embeds a compatible font and it contains every newly entered glyph, the
 exporter reuses that font program. Otherwise it falls back to the configured Noto font rather
 than risking missing glyphs from a subset font.
@@ -80,6 +84,38 @@ level `text_edits` remain supported for older clients. A run only requires `span
 the source bbox, origin, direction, font, size, color, opacity, style, and measured advance are
 filled from the original PDF. Supply any of those fields only when intentionally overriding that
 specific property.
+
+## Image editing
+
+`PageContent.images` identifies every editable image occurrence with a stable page-local ID,
+rotated-page bounding box, source pixel metadata, and PNG preview URL. Upload the browser's
+processed crop/rotation result to `/api/v1/images`, then move, replace, or delete the image while
+exporting:
+
+```json
+{
+  "filename": "edited-images.pdf",
+  "pages": [
+    {
+      "kind": "source",
+      "document_id": "DOCUMENT_ID",
+      "page_index": 0,
+      "image_edits": [
+        {
+          "image_id": "image-0",
+          "action": "replace",
+          "asset_id": "UPLOADED_IMAGE_ID",
+          "bbox": { "x0": 120, "y0": 80, "x1": 320, "y1": 230 }
+        },
+        { "image_id": "image-1", "action": "delete" }
+      ]
+    }
+  ]
+}
+```
+
+Omit `asset_id` from a `replace` edit to reuse and move the original image. Bounding boxes use
+the same rotated-page coordinate space as text edits and previews.
 
 ## Tests
 

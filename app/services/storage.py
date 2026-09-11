@@ -21,9 +21,11 @@ class FileStorage:
         self.originals = self.root / "originals"
         self.exports = self.root / "exports"
         self.watermarks = self.root / "watermarks"
+        self.images = self.root / "images"
         self.originals.mkdir(parents=True, exist_ok=True)
         self.exports.mkdir(parents=True, exist_ok=True)
         self.watermarks.mkdir(parents=True, exist_ok=True)
+        self.images.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _validated_id(file_id: str) -> str:
@@ -51,6 +53,12 @@ class FileStorage:
         path = self.watermarks / f"{self._validated_id(watermark_id)}.png"
         if not path.is_file():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="watermark not found")
+        return path
+
+    def image_path(self, image_id: str) -> Path:
+        path = self.images / f"{self._validated_id(image_id)}.png"
+        if not path.is_file():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="image not found")
         return path
 
     async def save_original(self, upload: UploadFile, max_bytes: int) -> tuple[str, Path]:
@@ -81,3 +89,7 @@ class FileStorage:
     def allocate_watermark(self) -> tuple[str, Path]:
         watermark_id = str(uuid4())
         return watermark_id, self.watermarks / f"{watermark_id}.png"
+
+    def allocate_image(self) -> tuple[str, Path]:
+        image_id = str(uuid4())
+        return image_id, self.images / f"{image_id}.png"

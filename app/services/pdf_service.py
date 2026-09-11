@@ -13,6 +13,9 @@ from app.schemas import (
     BlankPage,
     DocumentMetadata,
     ExportRequest,
+    ImageAssetMetadata,
+    ImageBlock,
+    ImageEdit,
     PageContent,
     PageMetadata,
     SourcePage,
@@ -87,7 +90,15 @@ class PdfService:
             matrix = pymupdf.Matrix(scale, scale)
             return page.get_pixmap(matrix=matrix, alpha=False).tobytes("png")
 
-    def render_edit_background(self, document_id: str, page_index: int, scale: float) -> bytes:
+    def render_edit_background(
+        self,
+        document_id: str,
+        page_index: int,
+        scale: float,
+        *,
+        remove_text: bool = True,
+        remove_images: bool = False,
+    ) -> bytes:
         path = self.storage.original_path(document_id)
         with self._open_pdf(path) as source:
             if page_index >= source.page_count:
@@ -96,14 +107,23 @@ class PdfService:
             try:
                 background.insert_pdf(source, from_page=page_index, to_page=page_index)
                 page = background[0]
-                for block in page.get_text("dict").get("blocks", []):
-                    if block.get("type") == 0 and block.get("lines"):
+                if remove_text:
+                    for block in page.get_text("dict").get("blocks", []):
+                        if block.get("type") == 0 and block.get("lines"):
+                            page.add_redact_annot(
+                                pymupdf.Rect(block["bbox"]),
+                                fill=False,
+                                cross_out=False,
+                            )
+                    page.apply_redactions(images=0, graphics=0, text=0)
+                if remove_images:
+                    for image in page.get_image_info(xrefs=True):
                         page.add_redact_annot(
-                            pymupdf.Rect(block["bbox"]),
+                            pymupdf.Rect(image["bbox"]),
                             fill=False,
                             cross_out=False,
                         )
-                page.apply_redactions(images=0, graphics=0, text=0)
+                    page.apply_redactions(images=2, graphics=0, text=0)
                 return page.get_pixmap(
                     matrix=pymupdf.Matrix(scale, scale),
                     alpha=False,
@@ -118,7 +138,7 @@ class PdfService:
             for character in font_name.split("+")[-1].lower()
             if character.isalnum()
         )
-        for suffix in ("regular", "roman", "psmt", "mt", "ps"):
+        for suffix in ("regular", "roman", "book", "psmt", "mt", "ps"):
             if key.endswith(suffix):
                 return key[: -len(suffix)]
         return key
@@ -179,42 +199,15 @@ class PdfService:
 
     def _span_advance(
         self,
-        document: pymupdf.Document,
         raw_span: dict[str, Any],
         direction: Any,
-        font_xref: int | None,
-        font_cache: dict[int, pymupdf.Font | None],
     ) -> float:
         characters = raw_span.get("chars", [])
         if not characters:
             return 0.0
-        text = "".join(character.get("c", "") for character in characters)
-        font: pymupdf.Font | None = None
-        if font_xref is not None:
-            if font_xref not in font_cache:
-                try:
-                    _name, _extension, _font_type, content = document.extract_font(font_xref)
-                    font_cache[font_xref] = (
-                        pymupdf.Font(fontbuffer=content) if content else None
-                    )
-                except (RuntimeError, ValueError):
-                    font_cache[font_xref] = None
-            font = font_cache[font_xref]
-        if font is None:
-            flags = int(raw_span.get("flags", 0))
-            builtin_name = self.font_resolver.builtin_latin_font(
-                str(raw_span.get("font", "")),
-                700 if flags & 16 else 400,
-                bool(flags & 2),
-            )
-            if builtin_name and self.font_resolver.is_native_builtin(
-                str(raw_span.get("font", "")),
-                builtin_name,
-            ):
-                font = pymupdf.Font(fontname=builtin_name)
-        if font is not None:
-            return font.text_length(text, fontsize=float(raw_span.get("size", 11)))
-
+        # PDF text operators may add character spacing, word spacing, or horizontal
+        # scaling. Font metrics alone lose those adjustments, so measure the visual
+        # advance from the source glyph geometry instead.
         unit = pymupdf.Point(direction)
         length = hypot(unit.x, unit.y)
         if length == 0:
@@ -238,7 +231,60 @@ class PdfService:
             xref, extension, _font_type, base_font = font[:4]
             if xref > 0:
                 font_map.setdefault(self._font_key(base_font), []).append((xref, extension))
+        for candidates in font_map.values():
+            candidates.sort(
+                key=lambda candidate: (
+                    candidate[1].lower() not in BROWSER_FONT_EXTENSIONS,
+                    candidate[0],
+                )
+            )
         return font_map
+
+    def _page_images(self, page: pymupdf.Page) -> list[tuple[str, dict[str, Any]]]:
+        return [
+            (f"image-{index}", image)
+            for index, image in enumerate(page.get_image_info(xrefs=True))
+            if pymupdf.Rect(image["bbox"]).get_area() > 0
+        ]
+
+    def _image_info(
+        self,
+        page: pymupdf.Page,
+        image_id: str,
+    ) -> dict[str, Any]:
+        image = dict(self._page_images(page)).get(image_id)
+        if image is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="image not found")
+        return image
+
+    @staticmethod
+    def _pixmap_png(document: pymupdf.Document, page: pymupdf.Page, image: dict[str, Any]) -> bytes:
+        xref = int(image.get("xref", 0))
+        if xref > 0:
+            pixmap = pymupdf.Pixmap(document, xref)
+            image_row = next((row for row in page.get_images(full=True) if row[0] == xref), None)
+            smask = int(image_row[1]) if image_row else 0
+            if smask > 0:
+                mask = pymupdf.Pixmap(document, smask)
+                try:
+                    pixmap = pymupdf.Pixmap(pixmap, mask)
+                finally:
+                    mask = None
+            if pixmap.colorspace and pixmap.colorspace.n > 3:
+                pixmap = pymupdf.Pixmap(pymupdf.csRGB, pixmap)
+            return pixmap.tobytes("png")
+
+        clip = pymupdf.Rect(image["bbox"])
+        return page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=clip, alpha=True).tobytes("png")
+
+    def extract_page_image(self, document_id: str, page_index: int, image_id: str) -> bytes:
+        path = self.storage.original_path(document_id)
+        with self._open_pdf(path) as document:
+            if page_index >= document.page_count:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="page not found")
+            page = document[page_index]
+            image = self._image_info(page, image_id)
+            return self._pixmap_png(document, page, image)
 
     def extract_page_content(self, document_id: str, page_index: int) -> PageContent:
         path = self.storage.original_path(document_id)
@@ -247,7 +293,6 @@ class PdfService:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="page not found")
             page = document[page_index]
             font_map = self._page_font_map(page)
-            font_metric_cache: dict[int, pymupdf.Font | None] = {}
             blocks: list[TextBlock] = []
             for block_index, block in enumerate(page.get_text("rawdict").get("blocks", [])):
                 if block.get("type") != 0:
@@ -293,11 +338,8 @@ class PdfService:
                             origin=self._point_payload(span_origin),
                             advance=round(
                                 self._span_advance(
-                                    document,
                                     raw_span,
                                     raw_direction,
-                                    font_xref,
-                                    font_metric_cache,
                                 ),
                                 3,
                             ),
@@ -377,12 +419,30 @@ class PdfService:
                         lines=lines,
                     )
                 )
+            images = [
+                ImageBlock(
+                    id=image_id,
+                    bbox=self._rect_payload(self._display_rect(page, image["bbox"])),
+                    width=int(image["width"]),
+                    height=int(image["height"]),
+                    xref=int(image.get("xref", 0)) or None,
+                    bits_per_component=int(image.get("bpc", 0)),
+                    colorspace=str(image.get("cs-name", "")),
+                    has_mask=bool(image.get("has-mask", False)),
+                    preview_url=(
+                        f"/api/v1/documents/{document_id}/pages/{page_index}"
+                        f"/images/{image_id}/preview"
+                    ),
+                )
+                for image_id, image in self._page_images(page)
+            ]
             return PageContent(
                 document_id=document_id,
                 page_index=page_index,
                 width=round(page.rect.width, 3),
                 height=round(page.rect.height, 3),
                 blocks=blocks,
+                images=images,
             )
 
     def create_watermark(
@@ -412,6 +472,35 @@ class PdfService:
             width=width,
             height=height,
             preview_url=f"/api/v1/watermarks/{watermark_id}/preview",
+        )
+
+    def create_image_asset(
+        self,
+        content: bytes,
+        filename: str,
+        destination: Path,
+        image_id: str,
+    ) -> ImageAssetMetadata:
+        try:
+            with Image.open(BytesIO(content)) as image:
+                if image.format not in {"PNG", "JPEG", "WEBP"}:
+                    raise ValueError("unsupported image format")
+                normalized = image.convert("RGBA")
+                normalized.thumbnail((8192, 8192), Image.Resampling.LANCZOS)
+                normalized.save(destination, format="PNG", optimize=True)
+                width, height = normalized.size
+        except (ValueError, UnidentifiedImageError, OSError) as exc:
+            destination.unlink(missing_ok=True)
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="image must be a valid PNG, JPEG, or WebP file",
+            ) from exc
+        return ImageAssetMetadata(
+            id=image_id,
+            filename=filename,
+            width=width,
+            height=height,
+            preview_url=f"/api/v1/images/{image_id}/preview",
         )
 
     @staticmethod
@@ -731,7 +820,9 @@ class PdfService:
         edited.insert_pdf(source, from_page=spec.page_index, to_page=spec.page_index)
         page = edited[0]
         try:
-            prepared: list[tuple[TextEdit, TextRunEdit | None, pymupdf.Rect]] = []
+            prepared: list[
+                tuple[TextEdit, TextRunEdit | None, pymupdf.Rect, pymupdf.Rect]
+            ] = []
             source_spans: dict[tuple[str, str], tuple[TextSpan, TextLine]] = {}
             if any(text_edit.runs for text_edit in spec.text_edits):
                 source_layout = self.extract_page_content(spec.document_id, spec.page_index)
@@ -763,25 +854,99 @@ class PdfService:
                         seen_span_ids.add(run.span_id)
                         source_span, source_line = source_entry
                         run = self._materialize_text_run(run, source_span, source_line)
+                        source_bbox = source_span.bbox
+                    else:
+                        source_bbox = text_edit.bbox
                     bbox = run.bbox if run is not None else text_edit.bbox
                     assert bbox is not None
-                    rect = pymupdf.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+                    assert source_bbox is not None
+                    target_rect = pymupdf.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+                    source_rect = pymupdf.Rect(
+                        source_bbox.x0,
+                        source_bbox.y0,
+                        source_bbox.x1,
+                        source_bbox.y1,
+                    )
                     if page.rotation:
-                        rect = rect * page.derotation_matrix
-                    rect = rect.intersect(page.cropbox)
-                    if rect.is_empty:
+                        target_rect = target_rect * page.derotation_matrix
+                        source_rect = source_rect * page.derotation_matrix
+                    target_rect = target_rect.intersect(page.cropbox)
+                    source_rect = source_rect.intersect(page.cropbox)
+                    if target_rect.is_empty:
                         target_id = run.span_id if run is not None else text_edit.block_id
                         raise HTTPException(
                             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                             detail=f"text box {target_id} is outside the page",
                         )
-                    page.add_redact_annot(rect, fill=False, cross_out=False)
-                    prepared.append((text_edit, run, rect))
+                    page.add_redact_annot(source_rect, fill=False, cross_out=False)
+                    prepared.append((text_edit, run, source_rect, target_rect))
             if prepared:
                 page.apply_redactions(images=0, graphics=0, text=0)
 
+            source_page = source[spec.page_index]
+            page_images = dict(self._page_images(source_page))
+            prepared_images: list[tuple[ImageEdit, dict[str, Any], pymupdf.Rect]] = []
+            seen_image_ids: set[str] = set()
+            for image_edit in spec.image_edits:
+                if image_edit.image_id in seen_image_ids:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail=f"image {image_edit.image_id} is edited more than once",
+                    )
+                seen_image_ids.add(image_edit.image_id)
+                image_info = page_images.get(image_edit.image_id)
+                if image_info is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail=(
+                            f"image {image_edit.image_id} does not belong to source page "
+                            f"{spec.page_index}"
+                        ),
+                    )
+                source_rect = self._display_rect(source_page, image_info["bbox"])
+                target_bbox = image_edit.bbox
+                target_rect = (
+                    pymupdf.Rect(
+                        target_bbox.x0,
+                        target_bbox.y0,
+                        target_bbox.x1,
+                        target_bbox.y1,
+                    )
+                    if target_bbox is not None
+                    else pymupdf.Rect(source_rect)
+                )
+                if page.rotation:
+                    source_rect = source_rect * page.derotation_matrix
+                    target_rect = target_rect * page.derotation_matrix
+                source_rect = source_rect.intersect(page.cropbox)
+                target_rect = target_rect.intersect(page.cropbox)
+                if target_rect.is_empty:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail=f"image box {image_edit.image_id} is outside the page",
+                    )
+                page.add_redact_annot(source_rect, fill=False, cross_out=False)
+                prepared_images.append((image_edit, image_info, target_rect))
+            if prepared_images:
+                page.apply_redactions(images=2, graphics=0, text=0)
+
+            for image_edit, image_info, target_rect in prepared_images:
+                if image_edit.action == "delete":
+                    continue
+                image_bytes = (
+                    self.storage.image_path(image_edit.asset_id).read_bytes()
+                    if image_edit.asset_id is not None
+                    else self._pixmap_png(source, source_page, image_info)
+                )
+                page.insert_image(
+                    target_rect,
+                    stream=image_bytes,
+                    keep_proportion=False,
+                    overlay=True,
+                )
+
             results = []
-            for slot, (text_edit, run, rect) in enumerate(prepared):
+            for slot, (text_edit, run, _source_rect, target_rect) in enumerate(prepared):
                 if run is not None:
                     result = self._write_text_run(
                         source,
@@ -789,7 +954,7 @@ class PdfService:
                         spec.page_index,
                         text_edit.block_id,
                         run,
-                        rect,
+                        target_rect,
                         slot,
                     )
                 else:
@@ -798,7 +963,7 @@ class PdfService:
                         page,
                         spec.page_index,
                         text_edit,
-                        rect,
+                        target_rect,
                         slot,
                     )
                 if result is not None:
@@ -836,7 +1001,7 @@ class PdfService:
                 try:
                     render_source = source
                     render_index = spec.page_index
-                    if spec.text_edits:
+                    if spec.text_edits or spec.image_edits:
                         edited_source, page_results = self._edited_page_document(source, spec)
                         text_edit_results.extend(page_results)
                         render_source = edited_source
@@ -876,5 +1041,8 @@ class PdfService:
         for spec in specs:
             if isinstance(spec, SourcePage):
                 self.storage.original_path(spec.document_id)
+                for image_edit in spec.image_edits:
+                    if image_edit.asset_id is not None:
+                        self.storage.image_path(image_edit.asset_id)
             if spec.watermark is not None:
                 self.storage.watermark_path(spec.watermark.watermark_id)
