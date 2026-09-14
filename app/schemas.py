@@ -31,12 +31,30 @@ class CropBox(BaseModel):
 
 
 class WatermarkSpec(BaseModel):
-    watermark_id: str
+    kind: Literal["image", "text"] = "image"
+    watermark_id: str | None = None
+    text: str = Field(default="", max_length=500)
+    font_name: str = Field(default="Helvetica", max_length=120)
+    font_size: Annotated[float, Field(gt=0, le=512)] = 48
+    color: str = Field(default="#000000", pattern=r"^#[0-9a-fA-F]{6}$")
+    font_weight: Literal[400, 700] = 400
+    italic: bool = False
+    underline: bool = False
     rotation: Annotated[float, Field(ge=-180, le=180)] = 0
     scale: Annotated[float, Field(ge=0.05, le=1)] = 0.35
     opacity: Annotated[float, Field(ge=0.05, le=1)] = 0.35
     x: Annotated[float, Field(ge=0, le=1)] = 0.5
     y: Annotated[float, Field(ge=0, le=1)] = 0.5
+    tiled: bool = False
+    tile_rows: Annotated[int, Field(ge=1, le=8)] = 3
+
+    @model_validator(mode="after")
+    def validate_payload(self) -> "WatermarkSpec":
+        if self.kind == "image" and not self.watermark_id:
+            raise ValueError("image watermark requires watermark_id")
+        if self.kind == "text" and not self.text.strip():
+            raise ValueError("text watermark requires text")
+        return self
 
 
 class PdfRect(BaseModel):
@@ -159,14 +177,16 @@ class TextStyleSegment(BaseModel):
 
     @model_validator(mode="after")
     def validate_segment(self) -> "TextStyleSegment":
-        if "\n" in self.text or "\r" in self.text:
-            raise ValueError("styled text segment must stay on one line")
+        if "\r" in self.text:
+            raise ValueError("styled text segment must use LF line breaks")
         return self
 
 
 class TextRunEdit(BaseModel):
     span_id: str = Field(min_length=1, max_length=120)
     text: str = Field(max_length=20_000)
+    inserted: bool = False
+    wrap: bool = False
     bbox: PdfRect | None = None
     font_size: Annotated[float, Field(gt=0, le=512)] | None = None
     color: Annotated[str, Field(pattern=r"^#[0-9a-fA-F]{6}$")] | None = None
@@ -188,8 +208,8 @@ class TextRunEdit(BaseModel):
     def validate_run(self) -> "TextRunEdit":
         if self.bbox is not None and not self.bbox.has_positive_area:
             raise ValueError("span text box must have a positive area")
-        if "\n" in self.text or "\r" in self.text:
-            raise ValueError("span text must stay on one line; submit one run per output line")
+        if "\r" in self.text:
+            raise ValueError("span text must use LF line breaks")
         if self.direction is not None and (
             abs(self.direction.x) < 1e-9 and abs(self.direction.y) < 1e-9
         ):
@@ -198,6 +218,25 @@ class TextRunEdit(BaseModel):
             raise ValueError("vertical writing mode is not supported for span replacement")
         if self.segments and "".join(segment.text for segment in self.segments) != self.text:
             raise ValueError("styled text segments must concatenate to the run text")
+        if self.inserted:
+            missing = [
+                name
+                for name, value in (
+                    ("bbox", self.bbox),
+                    ("font_size", self.font_size),
+                    ("color", self.color),
+                    ("alpha", self.alpha),
+                    ("font_name", self.font_name),
+                    ("font_weight", self.font_weight),
+                    ("italic", self.italic),
+                    ("origin", self.origin),
+                    ("direction", self.direction),
+                    ("source_advance", self.source_advance),
+                )
+                if value is None
+            ]
+            if missing:
+                raise ValueError(f"inserted text run is missing: {', '.join(missing)}")
         return self
 
 
@@ -239,8 +278,8 @@ class TextEdit(BaseModel):
 
 
 class ImageEdit(BaseModel):
-    image_id: str = Field(pattern=r"^image-\d+$")
-    action: Literal["delete", "replace"]
+    image_id: str = Field(min_length=1, max_length=120)
+    action: Literal["delete", "replace", "insert"]
     bbox: PdfRect | None = None
     asset_id: str | None = None
     rotation: Annotated[float, Field(ge=-180, le=180)] = 0
@@ -251,6 +290,8 @@ class ImageEdit(BaseModel):
             raise ValueError("image box must have a positive area")
         if self.action == "delete" and self.asset_id is not None:
             raise ValueError("deleted images cannot include an asset_id")
+        if self.action == "insert" and (self.asset_id is None or self.bbox is None):
+            raise ValueError("inserted images require an asset_id and bbox")
         return self
 
 
@@ -271,6 +312,8 @@ class BlankPage(BaseModel):
     height: Annotated[float, Field(gt=0, le=2880)] = 842
     rotation: Literal[0, 90, 180, 270] = 0
     watermark: WatermarkSpec | None = None
+    text_edits: list[TextEdit] = Field(default_factory=list, max_length=500)
+    image_edits: list[ImageEdit] = Field(default_factory=list, max_length=500)
 
 
 PageSpec = Annotated[SourcePage | BlankPage, Field(discriminator="kind")]

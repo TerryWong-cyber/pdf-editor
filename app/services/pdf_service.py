@@ -569,6 +569,10 @@ class PdfService:
     def _apply_watermark(self, page: pymupdf.Page, spec: WatermarkSpec | None) -> None:
         if spec is None:
             return
+        if spec.kind == "text":
+            self._apply_text_watermark(page, spec)
+            return
+        assert spec.watermark_id is not None
         watermark_path = self.storage.watermark_path(spec.watermark_id)
         try:
             with Image.open(watermark_path) as source:
@@ -607,6 +611,65 @@ class PdfService:
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                 detail=f"watermark {spec.watermark_id} could not be rendered",
             ) from exc
+
+    def _apply_text_watermark(self, page: pymupdf.Page, spec: WatermarkSpec) -> None:
+        """Render a text watermark without requiring an uploaded image asset."""
+        font = self.font_resolver.resolve(
+            spec.text,
+            0,
+            preferred_name=spec.font_name,
+            font_weight=spec.font_weight,
+            italic=spec.italic,
+        )
+        self._register_font(page, font)
+        font_size = spec.font_size * spec.scale
+        metrics = self._font_metrics(font)
+        lines = spec.text.splitlines() or [spec.text]
+        line_height = font_size * 1.2
+        text_height = line_height * len(lines)
+        row_positions = (
+            [(index + 1) / (spec.tile_rows + 1) for index in range(spec.tile_rows)]
+            if spec.tiled
+            else [spec.y]
+        )
+        color = self._pdf_color(spec.color)
+        for center_y_fraction in row_positions:
+            center_y = page.rect.y0 + page.rect.height * center_y_fraction
+            start_y = center_y - text_height / 2
+            for index, line in enumerate(lines):
+                line_width = metrics.text_length(line, fontsize=font_size)
+                baseline = pymupdf.Point(
+                    page.rect.x0 + page.rect.width * spec.x - line_width / 2,
+                    start_y + font_size + index * line_height,
+                )
+                morph = (
+                    (pymupdf.Point(page.rect.x0 + page.rect.width * spec.x, center_y), pymupdf.Matrix(spec.rotation))
+                    if abs(spec.rotation) > 0.01
+                    else None
+                )
+                page.insert_text(
+                    baseline,
+                    line,
+                    fontname=font.name,
+                    fontfile=str(font.path) if font.path else None,
+                    fontsize=font_size,
+                    color=color,
+                    fill_opacity=spec.opacity,
+                    stroke_opacity=spec.opacity,
+                    morph=morph,
+                    overlay=True,
+                )
+                if spec.underline and line:
+                    underline_y = baseline.y + font_size * 0.12
+                    page.draw_line(
+                        pymupdf.Point(baseline.x, underline_y),
+                        pymupdf.Point(baseline.x + line_width, underline_y),
+                        color=color,
+                        width=max(0.45, font_size * 0.045),
+                        morph=morph,
+                        stroke_opacity=spec.opacity,
+                        overlay=True,
+                    )
 
     @staticmethod
     def _pdf_color(hex_color: str) -> tuple[float, float, float]:
@@ -706,6 +769,16 @@ class PdfService:
     ) -> TextEditResult | None:
         if not run.text:
             return None
+        if run.wrap or "\n" in run.text:
+            return self._write_multiline_text_run(
+                source,
+                page,
+                page_index,
+                block_id,
+                run,
+                rect,
+                slot,
+            )
         if run.segments:
             return self._write_rich_text_run(
                 source,
@@ -784,6 +857,100 @@ class PdfService:
             font_source=font.source,
             font_substituted=font.substituted,
             requested_font_size=round(run.font_size, 3),
+            effective_font_size=round(effective_font_size, 3),
+            overflow_action=overflow_action,
+        )
+
+    def _write_multiline_text_run(
+        self,
+        source: pymupdf.Document,
+        page: pymupdf.Page,
+        page_index: int,
+        block_id: str,
+        run: TextRunEdit,
+        rect: pymupdf.Rect,
+        slot: int,
+    ) -> TextEditResult:
+        assert run.font_size is not None
+        assert run.color is not None
+        assert run.alpha is not None
+        assert run.font_name is not None
+        assert run.font_weight is not None
+        assert run.italic is not None
+        assert run.direction is not None
+        style = next((segment for segment in run.segments if segment.text), None)
+        font_size = style.font_size if style and style.font_size else run.font_size
+        font_name = style.font_name if style and style.font_name else run.font_name
+        font_weight = (
+            style.font_weight if style and style.font_weight is not None else run.font_weight
+        )
+        italic = style.italic if style and style.italic is not None else run.italic
+        font_xref = (
+            style.font_xref
+            if style and "font_xref" in style.model_fields_set
+            else run.font_xref
+        )
+        color = style.color if style and style.color else run.color
+        alpha = style.alpha if style and style.alpha is not None else run.alpha
+        font = self._resolve_edit_font(
+            source,
+            page_index,
+            run.text,
+            font_xref,
+            font_name,
+            font_weight,
+            italic,
+            slot,
+        )
+        self._register_font(page, font)
+        direction = self._source_direction(page, run.direction)
+        angle = -degrees(atan2(direction.y, direction.x))
+        morph = None
+        if abs(angle) > 0.01:
+            center = pymupdf.Point(
+                (rect.x0 + rect.x1) / 2,
+                (rect.y0 + rect.y1) / 2,
+            )
+            morph = (center, pymupdf.Matrix(angle))
+
+        effective_font_size = font_size
+        minimum_size = max(4.0, font_size * run.minimum_font_scale)
+        overflow_action = "none"
+        inserted = -1.0
+        while effective_font_size >= minimum_size:
+            inserted = page.insert_textbox(
+                rect,
+                run.text,
+                fontname=font.name,
+                fontfile=str(font.path) if font.path else None,
+                fontsize=effective_font_size,
+                color=self._pdf_color(color),
+                lineheight=1.2,
+                fill_opacity=alpha / 255,
+                stroke_opacity=alpha / 255,
+                render_mode=run.render_mode,
+                morph=morph,
+            )
+            if inserted >= 0:
+                break
+            if run.overflow_policy == "error":
+                break
+            effective_font_size -= 0.5
+            overflow_action = "shrink"
+        if inserted < 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail=f"edited multiline text does not fit in {run.span_id}",
+            )
+        return TextEditResult(
+            page_index=page_index,
+            block_id=block_id,
+            span_id=run.span_id,
+            requested_font_name=font_name,
+            resolved_font_name=font.name,
+            font_source=font.source,
+            font_substituted=font.substituted,
+            requested_font_size=round(font_size, 3),
             effective_font_size=round(effective_font_size, 3),
             overflow_action=overflow_action,
         )
@@ -1034,7 +1201,12 @@ class PdfService:
                 tuple[TextEdit, TextRunEdit | None, pymupdf.Rect, pymupdf.Rect]
             ] = []
             source_spans: dict[tuple[str, str], tuple[TextSpan, TextLine]] = {}
-            if any(text_edit.runs for text_edit in spec.text_edits):
+            if any(
+                run
+                for text_edit in spec.text_edits
+                for run in text_edit.runs
+                if not run.inserted
+            ):
                 source_layout = self.extract_page_content(spec.document_id, spec.page_index)
                 source_spans = {
                     (block.id, span.id): (span, line)
@@ -1043,39 +1215,46 @@ class PdfService:
                     for span in line.spans
                 }
             seen_span_ids: set[str] = set()
+            has_text_redactions = False
             for text_edit in spec.text_edits:
                 edit_runs: list[TextRunEdit | None] = list(text_edit.runs) or [None]
                 for run in edit_runs:
                     if run is not None:
-                        source_entry = source_spans.get((text_edit.block_id, run.span_id))
-                        if source_entry is None:
-                            raise HTTPException(
-                                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                detail=(
-                                    f"text span {run.span_id} does not belong to "
-                                    f"{text_edit.block_id} on source page {spec.page_index}"
-                                ),
-                            )
                         if run.span_id in seen_span_ids:
                             raise HTTPException(
                                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                                 detail=f"text span {run.span_id} is edited more than once",
                             )
                         seen_span_ids.add(run.span_id)
-                        source_span, source_line = source_entry
-                        run = self._materialize_text_run(run, source_span, source_line)
-                        source_bbox = source_span.bbox
+                        if run.inserted:
+                            source_bbox = None
+                        else:
+                            source_entry = source_spans.get((text_edit.block_id, run.span_id))
+                            if source_entry is None:
+                                raise HTTPException(
+                                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                    detail=(
+                                        f"text span {run.span_id} does not belong to "
+                                        f"{text_edit.block_id} on source page {spec.page_index}"
+                                    ),
+                                )
+                            source_span, source_line = source_entry
+                            run = self._materialize_text_run(run, source_span, source_line)
+                            source_bbox = source_span.bbox
                     else:
                         source_bbox = text_edit.bbox
                     bbox = run.bbox if run is not None else text_edit.bbox
                     assert bbox is not None
-                    assert source_bbox is not None
                     target_rect = pymupdf.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
-                    source_rect = pymupdf.Rect(
-                        source_bbox.x0,
-                        source_bbox.y0,
-                        source_bbox.x1,
-                        source_bbox.y1,
+                    source_rect = (
+                        pymupdf.Rect(
+                            source_bbox.x0,
+                            source_bbox.y0,
+                            source_bbox.x1,
+                            source_bbox.y1,
+                        )
+                        if source_bbox is not None
+                        else pymupdf.Rect(target_rect)
                     )
                     if page.rotation:
                         target_rect = target_rect * page.derotation_matrix
@@ -1088,15 +1267,20 @@ class PdfService:
                             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                             detail=f"text box {target_id} is outside the page",
                         )
-                    page.add_redact_annot(source_rect, fill=False, cross_out=False)
+                    if run is None or not run.inserted:
+                        page.add_redact_annot(source_rect, fill=False, cross_out=False)
+                        has_text_redactions = True
                     prepared.append((text_edit, run, source_rect, target_rect))
-            if prepared:
+            if has_text_redactions:
                 page.apply_redactions(images=0, graphics=0, text=0)
 
             source_page = source[spec.page_index]
             page_images = dict(self._page_images(source_page))
-            prepared_images: list[tuple[ImageEdit, dict[str, Any], pymupdf.Rect]] = []
+            prepared_images: list[
+                tuple[ImageEdit, dict[str, Any] | None, pymupdf.Rect]
+            ] = []
             seen_image_ids: set[str] = set()
+            has_image_redactions = False
             for image_edit in spec.image_edits:
                 if image_edit.image_id in seen_image_ids:
                     raise HTTPException(
@@ -1104,6 +1288,24 @@ class PdfService:
                         detail=f"image {image_edit.image_id} is edited more than once",
                     )
                 seen_image_ids.add(image_edit.image_id)
+                if image_edit.action == "insert":
+                    assert image_edit.bbox is not None
+                    target_rect = pymupdf.Rect(
+                        image_edit.bbox.x0,
+                        image_edit.bbox.y0,
+                        image_edit.bbox.x1,
+                        image_edit.bbox.y1,
+                    )
+                    if page.rotation:
+                        target_rect = target_rect * page.derotation_matrix
+                    visible_target_rect = pymupdf.Rect(target_rect).intersect(page.cropbox)
+                    if visible_target_rect.is_empty:
+                        raise HTTPException(
+                            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                            detail=f"image box {image_edit.image_id} is outside the page",
+                        )
+                    prepared_images.append((image_edit, None, target_rect))
+                    continue
                 image_info = page_images.get(image_edit.image_id)
                 if image_info is None:
                     raise HTTPException(
@@ -1129,25 +1331,26 @@ class PdfService:
                     source_rect = source_rect * page.derotation_matrix
                     target_rect = target_rect * page.derotation_matrix
                 source_rect = source_rect.intersect(page.cropbox)
-                target_rect = target_rect.intersect(page.cropbox)
-                if target_rect.is_empty:
+                visible_target_rect = pymupdf.Rect(target_rect).intersect(page.cropbox)
+                if visible_target_rect.is_empty:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=f"image box {image_edit.image_id} is outside the page",
                     )
                 page.add_redact_annot(source_rect, fill=False, cross_out=False)
+                has_image_redactions = True
                 prepared_images.append((image_edit, image_info, target_rect))
-            if prepared_images:
+            if has_image_redactions:
                 page.apply_redactions(images=2, graphics=0, text=0)
 
             for image_edit, image_info, target_rect in prepared_images:
                 if image_edit.action == "delete":
                     continue
-                image_bytes = (
-                    self.storage.image_path(image_edit.asset_id).read_bytes()
-                    if image_edit.asset_id is not None
-                    else self._pixmap_png(source, source_page, image_info)
-                )
+                if image_edit.asset_id is not None:
+                    image_bytes = self.storage.image_path(image_edit.asset_id).read_bytes()
+                else:
+                    assert image_info is not None
+                    image_bytes = self._pixmap_png(source, source_page, image_info)
                 image_bytes, insert_rect = self._rotate_image_for_rect(
                     image_bytes,
                     target_rect,
@@ -1199,6 +1402,68 @@ class PdfService:
                     if spec.rotation in (90, 270):
                         width, height = height, width
                     target_page = output.new_page(width=width, height=height)
+                    for image_edit in spec.image_edits:
+                        if image_edit.action != "insert":
+                            raise HTTPException(
+                                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                detail="blank pages only accept inserted images",
+                            )
+                        assert image_edit.asset_id is not None
+                        assert image_edit.bbox is not None
+                        target_rect = pymupdf.Rect(
+                            image_edit.bbox.x0,
+                            image_edit.bbox.y0,
+                            image_edit.bbox.x1,
+                            image_edit.bbox.y1,
+                        )
+                        visible_target_rect = pymupdf.Rect(target_rect).intersect(target_page.rect)
+                        if visible_target_rect.is_empty:
+                            raise HTTPException(
+                                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                detail=f"image box {image_edit.image_id} is outside the page",
+                            )
+                        image_bytes = self.storage.image_path(image_edit.asset_id).read_bytes()
+                        image_bytes, insert_rect = self._rotate_image_for_rect(
+                            image_bytes,
+                            target_rect,
+                            image_edit.rotation,
+                        )
+                        target_page.insert_image(
+                            insert_rect,
+                            stream=image_bytes,
+                            keep_proportion=False,
+                            overlay=True,
+                        )
+                    for text_edit in spec.text_edits:
+                        if not text_edit.runs or any(not run.inserted for run in text_edit.runs):
+                            raise HTTPException(
+                                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                detail="blank pages only accept inserted text runs",
+                            )
+                        for slot, run in enumerate(text_edit.runs):
+                            assert run.bbox is not None
+                            target_rect = pymupdf.Rect(
+                                run.bbox.x0,
+                                run.bbox.y0,
+                                run.bbox.x1,
+                                run.bbox.y1,
+                            ).intersect(target_page.rect)
+                            if target_rect.is_empty:
+                                raise HTTPException(
+                                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                                    detail=f"text box {run.span_id} is outside the page",
+                                )
+                            result = self._write_text_run(
+                                output,
+                                target_page,
+                                target_page.number,
+                                text_edit.block_id,
+                                run,
+                                target_rect,
+                                slot,
+                            )
+                            if result is not None:
+                                text_edit_results.append(result)
                     self._apply_watermark(target_page, spec.watermark)
                     continue
 
@@ -1256,8 +1521,10 @@ class PdfService:
         for spec in specs:
             if isinstance(spec, SourcePage):
                 self.storage.original_path(spec.document_id)
-                for image_edit in spec.image_edits:
-                    if image_edit.asset_id is not None:
-                        self.storage.image_path(image_edit.asset_id)
+            for image_edit in spec.image_edits:
+                if image_edit.asset_id is not None:
+                    self.storage.image_path(image_edit.asset_id)
             if spec.watermark is not None:
-                self.storage.watermark_path(spec.watermark.watermark_id)
+                if spec.watermark.kind == "image":
+                    assert spec.watermark.watermark_id is not None
+                    self.storage.watermark_path(spec.watermark.watermark_id)

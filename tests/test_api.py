@@ -23,6 +23,115 @@ def test_font_key_normalizes_linux_dejavu_book_style() -> None:
     assert PdfService._font_key("DejaVu Sans Book") == PdfService._font_key("DejaVuSans")
 
 
+def test_inserts_text_and_image_on_source_and_blank_pages(
+    client: TestClient,
+    sample_pdf: Path,
+) -> None:
+    document = upload_sample(client, sample_pdf)
+    image_buffer = BytesIO()
+    Image.new("RGBA", (120, 60), (225, 35, 45, 255)).save(image_buffer, "PNG")
+    image_upload = client.post(
+        "/api/v1/images",
+        files={"file": ("insert.png", image_buffer.getvalue(), "image/png")},
+    )
+    assert image_upload.status_code == 201, image_upload.text
+    asset_id = image_upload.json()["id"]
+
+    def inserted_run(span_id: str, text: str, y: float) -> dict:
+        return {
+            "span_id": span_id,
+            "text": text,
+            "inserted": True,
+            "bbox": {"x0": 35, "y0": y, "x1": 250, "y1": y + 56},
+            "font_size": 15,
+            "color": "#000000",
+            "alpha": 255,
+            "font_name": "Helvetica",
+            "font_weight": 400,
+            "italic": False,
+            "origin": {"x": 37, "y": y + 18},
+            "direction": {"x": 1, "y": 0},
+            "writing_mode": 0,
+            "source_advance": 211,
+            "overflow_policy": "shrink",
+            "minimum_font_scale": 0.55,
+            "wrap": True,
+        }
+
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "filename": "inserted-content.pdf",
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "text_edits": [
+                        {
+                            "block_id": "inserted-block-source",
+                            "runs": [
+                                inserted_run(
+                                    "inserted-text-source",
+                                    "Inserted source text\nSecond source line",
+                                    105,
+                                )
+                            ],
+                        }
+                    ],
+                    "image_edits": [
+                        {
+                            "image_id": "inserted-image-source",
+                            "action": "insert",
+                            "asset_id": asset_id,
+                            "bbox": {"x0": 150, "y0": 160, "x1": 250, "y1": 210},
+                        }
+                    ],
+                },
+                {
+                    "kind": "blank",
+                    "width": 300,
+                    "height": 400,
+                    "text_edits": [
+                        {
+                            "block_id": "inserted-block-blank",
+                            "runs": [
+                                inserted_run(
+                                    "inserted-text-blank",
+                                    "Inserted blank text\nSecond blank line",
+                                    55,
+                                )
+                            ],
+                        }
+                    ],
+                    "image_edits": [
+                        {
+                            "image_id": "inserted-image-blank",
+                            "action": "insert",
+                            "asset_id": asset_id,
+                            "bbox": {"x0": 100, "y0": 130, "x1": 220, "y1": 190},
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    assert output.page_count == 2
+    assert "Inserted source text" in output[0].get_text()
+    assert "Second source line" in output[0].get_text()
+    assert "Sample page 1" in output[0].get_text()
+    assert "Inserted blank text" in output[1].get_text()
+    assert "Second blank line" in output[1].get_text()
+    source_render = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    blank_render = Image.open(BytesIO(output[1].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    assert source_render.getpixel((200, 185))[0] > 200
+    assert blank_render.getpixel((160, 160))[0] > 200
+
+
 def test_upload_and_preview(client: TestClient, sample_pdf: Path) -> None:
     document = upload_sample(client, sample_pdf)
     assert document["filename"] == "original.pdf"
@@ -844,6 +953,46 @@ def test_upload_and_apply_watermark_to_multiple_pages(
     output.close()
 
 
+def test_apply_text_watermark_without_uploading_an_image(
+    client: TestClient,
+    sample_pdf: Path,
+) -> None:
+    document = upload_sample(client, sample_pdf)
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "filename": "text-watermarked.pdf",
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "watermark": {
+                        "kind": "text",
+                        "text": "CONFIDENTIAL",
+                        "font_name": "Helvetica",
+                        "font_size": 72,
+                        "font_weight": 700,
+                        "rotation": -35,
+                        "scale": 0.7,
+                        "opacity": 0.3,
+                        "x": 0.5,
+                        "y": 0.5,
+                        "tiled": True,
+                        "tile_rows": 3,
+                    },
+                },
+            ],
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    extracted = output[0].get_text()
+    assert extracted.count("CONFIDENTIAL") == 3
+    output.close()
+
+
 def test_rejects_pdf_and_oversized_watermarks_before_decoding(client: TestClient) -> None:
     pdf_response = client.post(
         "/api/v1/watermarks",
@@ -858,3 +1007,48 @@ def test_rejects_pdf_and_oversized_watermarks_before_decoding(client: TestClient
     )
     assert oversized_response.status_code == 413
     assert oversized_response.json()["detail"] == "watermark exceeds 20 MB limit"
+
+
+def test_inserted_image_keeps_geometry_when_partially_outside_page(
+    client: TestClient,
+) -> None:
+    image_buffer = BytesIO()
+    image = Image.new("RGB", (100, 40), "red")
+    image.paste("blue", (50, 0, 100, 40))
+    image.save(image_buffer, "PNG")
+    upload = client.post(
+        "/api/v1/images",
+        files={"file": ("split.png", image_buffer.getvalue(), "image/png")},
+    )
+    assert upload.status_code == 201, upload.text
+
+    export = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "blank",
+                    "width": 100,
+                    "height": 100,
+                    "image_edits": [
+                        {
+                            "image_id": "inserted-image",
+                            "action": "insert",
+                            "asset_id": upload.json()["id"],
+                            "bbox": {"x0": -50, "y0": 20, "x1": 50, "y1": 60},
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert export.status_code == 201, export.text
+    result = client.get(export.json()["download_url"])
+    output = pymupdf.open(stream=result.content, filetype="pdf")
+    rendered = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+
+    visible_image = rendered.getpixel((10, 40))
+    outside_image = rendered.getpixel((70, 40))
+    assert visible_image[2] > 200 and visible_image[0] < 60
+    assert all(channel > 240 for channel in outside_image)
