@@ -7,6 +7,7 @@ from app.config import settings
 from app.dependencies import get_pdf_service, get_storage
 from app.schemas import (
     DocumentMetadata,
+    EditedPreviewRequest,
     ExportRequest,
     ExportResponse,
     ImageAssetMetadata,
@@ -226,6 +227,18 @@ def image_preview(
         storage.image_path(image_id),
         media_type="image/png",
         headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
+@router.post("/previews")
+def edited_page_preview(
+    request: EditedPreviewRequest,
+    pdf_service: Annotated[PdfService, Depends(get_pdf_service)],
+) -> Response:
+    return Response(
+        content=pdf_service.render_edited_preview(request.page, request.max_edge),
+        media_type="image/png",
+        headers={"Cache-Control": "no-store"},
     )
 
 

@@ -3,6 +3,7 @@ from io import BytesIO
 from math import atan2, cos, degrees, hypot, radians, sin
 from pathlib import Path
 from statistics import median
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import pymupdf
@@ -1390,6 +1391,18 @@ class PdfService:
         except Exception:
             edited.close()
             raise
+
+    def render_edited_preview(self, spec: SourcePage | BlankPage, max_edge: int = 360) -> bytes:
+        """Render the same composition as export without retaining an export file."""
+        self.validate_sources([spec])
+        with TemporaryDirectory(prefix="pdf-editor-preview-") as directory:
+            destination = Path(directory) / "preview.pdf"
+            self.compose(ExportRequest(pages=[spec]), destination)
+            with pymupdf.open(destination) as document:
+                page = document[0]
+                scale = max_edge / max(page.rect.width, page.rect.height)
+                pixmap = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+                return pixmap.tobytes("png")
 
     def compose(self, request: ExportRequest, destination: Path) -> list[TextEditResult]:
         output = pymupdf.open()

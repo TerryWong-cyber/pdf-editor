@@ -28,6 +28,12 @@ frontend development by default.
 - `GET /api/v1/documents/{id}/fonts/{xref}`: serve a browser-compatible embedded font.
 - `POST /api/v1/watermarks`: upload and normalize a PNG, JPEG, or WebP watermark image.
 - `POST /api/v1/exports`: compose arbitrary source pages and blank pages into a new PDF.
+- `POST /api/v1/previews`: render one edited page as a PNG. Accepts `page` and optional
+  `max_edge` (128–1600 pixels, default 360; dialogs use 1200).
+  Send `{"page": <one export page specification>}`; text/image edits, crop, rotation,
+  and watermarks use the same composition path as export. Temporary files are cleaned up;
+  no persistent export is created. The frontend refreshes both thumbnail views after
+  selection changes with a short debounce and discards superseded responses.
 - `GET /api/v1/exports/{id}/download`: download the generated copy.
 
 Delete, copy, reorder, extract, merge, rotate, crop, and blank-page creation all map to the

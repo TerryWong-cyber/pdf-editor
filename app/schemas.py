@@ -319,6 +319,11 @@ class BlankPage(BaseModel):
 PageSpec = Annotated[SourcePage | BlankPage, Field(discriminator="kind")]
 
 
+class EditedPreviewRequest(BaseModel):
+    page: PageSpec
+    max_edge: int = Field(default=360, ge=128, le=1600)
+
+
 class ExportRequest(BaseModel):
     filename: str = Field(default="edited-copy.pdf", min_length=1, max_length=180)
     pages: list[PageSpec] = Field(min_length=1, max_length=2000)
