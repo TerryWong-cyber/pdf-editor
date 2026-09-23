@@ -23,6 +23,33 @@ def test_font_key_normalizes_linux_dejavu_book_style() -> None:
     assert PdfService._font_key("DejaVu Sans Book") == PdfService._font_key("DejaVuSans")
 
 
+def test_page_image_filter_rejects_render_layers_and_reused_xrefs() -> None:
+    class FakePage:
+        rotation = 0
+        rect = pymupdf.Rect(0, 0, 300, 200)
+
+        @staticmethod
+        def get_images(*, full: bool) -> list[tuple[int, ...]]:
+            assert full
+            return [(10,), (20,)]
+
+        @staticmethod
+        def get_image_info(*, hashes: bool, xrefs: bool) -> list[dict]:
+            assert hashes and xrefs
+            return [
+                {"xref": 0, "bbox": (0, 140, 300, 200)},
+                {"xref": 10, "bbox": (10, 10, 30, 30)},
+                {"xref": 10, "bbox": (40, 10, 60, 30)},
+                {"xref": 20, "bbox": (90, 50, 150, 110)},
+            ]
+
+    service = object.__new__(PdfService)
+    images = service._page_images(FakePage())  # type: ignore[arg-type]
+    assert [(image_id, image["xref"]) for image_id, image in images] == [
+        ("image-0", 20)
+    ]
+
+
 def test_inserts_text_and_image_on_source_and_blank_pages(
     client: TestClient,
     sample_pdf: Path,
@@ -411,6 +438,72 @@ def test_extracts_previews_moves_replaces_and_deletes_page_images(
     rendered = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
     output.close()
     assert all(channel > 240 for channel in rendered.getpixel((60, 70)))
+
+
+def test_page_decoration_stays_while_overlapping_photo_moves(
+    client: TestClient,
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "photo-over-decoration.pdf"
+    footer = BytesIO()
+    photo = BytesIO()
+    Image.new("RGB", (300, 60), (25, 90, 210)).save(footer, "PNG")
+    Image.new("RGB", (100, 100), (225, 35, 45)).save(photo, "PNG")
+    source = pymupdf.open()
+    page = source.new_page(width=300, height=200)
+    page.insert_text((20, 30), "Foreground photo over a footer background", fontsize=10)
+    page.insert_image(pymupdf.Rect(0, 140, 300, 200), stream=footer.getvalue())
+    page.insert_image(pymupdf.Rect(50, 80, 150, 180), stream=photo.getvalue())
+    source.save(path)
+    source.close()
+
+    document = upload_sample(client, path)
+    content = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/content"
+    ).json()
+    assert len(content["images"]) == 1
+    image = content["images"][0]
+    assert image["bbox"] == {"x0": 50.0, "y0": 80.0, "x1": 150.0, "y1": 180.0}
+
+    targeted_background = client.get(
+        f"/api/v1/documents/{document['id']}/pages/0/edit-background",
+        params={"remove_text": "false", "image_id": image["id"]},
+    )
+    assert targeted_background.status_code == 200, targeted_background.text
+    targeted_render = Image.open(BytesIO(targeted_background.content)).convert("RGB")
+    exposed_footer = targeted_render.getpixel((100, 160))
+    assert exposed_footer[2] > 180 and exposed_footer[0] < 60
+
+    moved = client.post(
+        "/api/v1/exports",
+        json={
+            "pages": [
+                {
+                    "kind": "source",
+                    "document_id": document["id"],
+                    "page_index": 0,
+                    "image_edits": [
+                        {
+                            "image_id": image["id"],
+                            "action": "replace",
+                            "bbox": {"x0": 180, "y0": 20, "x1": 280, "y1": 120},
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert moved.status_code == 201, moved.text
+    moved_pdf = client.get(moved.json()["download_url"])
+    output = pymupdf.open(stream=moved_pdf.content, filetype="pdf")
+    moved_render = Image.open(BytesIO(output[0].get_pixmap().tobytes("png"))).convert("RGB")
+    output.close()
+    old_position = moved_render.getpixel((100, 160))
+    preserved_footer = moved_render.getpixel((250, 160))
+    new_position = moved_render.getpixel((230, 70))
+    assert old_position[2] > 180 and old_position[0] < 60
+    assert preserved_footer[2] > 180 and preserved_footer[0] < 60
+    assert new_position[0] > 180 and new_position[1] < 70
 
 
 def test_moves_text_span_using_target_bbox_and_origin(

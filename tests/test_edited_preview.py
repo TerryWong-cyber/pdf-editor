@@ -62,6 +62,41 @@ def test_text_preview_matches_export_without_retaining_files(
     assert reverted.content != response.content
 
 
+def test_text_moved_fully_off_page_is_clipped_instead_of_failing_preview(
+    client: TestClient,
+    sample_pdf: Path,
+) -> None:
+    document = upload(client, sample_pdf.read_bytes())
+    content = client.get(f"/api/v1/documents/{document['id']}/pages/0/content").json()
+    block = content["blocks"][0]
+    span = block["lines"][0]["spans"][0]
+    width = span["bbox"]["x1"] - span["bbox"]["x0"]
+    height = span["bbox"]["y1"] - span["bbox"]["y0"]
+    spec = {
+        "kind": "source",
+        "document_id": document["id"],
+        "page_index": 0,
+        "text_edits": [{
+            "block_id": block["id"],
+            "runs": [{
+                "span_id": span["id"],
+                "text": span["text"],
+                "bbox": {
+                    "x0": -200,
+                    "y0": -100,
+                    "x1": -200 + width,
+                    "y1": -100 + height,
+                },
+                "origin": {"x": -200, "y": -90},
+            }],
+        }],
+    }
+    response = client.post("/api/v1/previews", json={"page": spec})
+    assert response.status_code == 200, response.text
+    assert response.content.startswith(b"\x89PNG")
+    assert_matches_export(client, spec, response.content)
+
+
 @pytest.mark.parametrize("action", ["delete", "replace"])
 def test_image_preview_reflects_deletion_and_movement(client: TestClient, action: str) -> None:
     image = BytesIO()

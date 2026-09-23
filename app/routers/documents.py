@@ -78,6 +78,7 @@ def page_edit_background(
     scale: Annotated[float, Query(ge=0.25, le=3)] = 1,
     remove_text: bool = True,
     remove_images: bool = False,
+    image_id: str | None = None,
 ) -> Response:
     return Response(
         content=pdf_service.render_edit_background(
@@ -86,6 +87,7 @@ def page_edit_background(
             scale,
             remove_text=remove_text,
             remove_images=remove_images,
+            image_id=image_id,
         ),
         media_type="image/png",
         headers={"Cache-Control": "private, max-age=3600"},

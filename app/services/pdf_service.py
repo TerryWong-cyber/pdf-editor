@@ -149,6 +149,7 @@ class PdfService:
         *,
         remove_text: bool = True,
         remove_images: bool = False,
+        image_id: str | None = None,
     ) -> bytes:
         path = self.storage.original_path(document_id)
         with self._open_pdf(path) as source:
@@ -167,14 +168,20 @@ class PdfService:
                                 cross_out=False,
                             )
                     page.apply_redactions(images=0, graphics=0, text=0)
-                if remove_images:
-                    for image in page.get_image_info(xrefs=True):
-                        page.add_redact_annot(
-                            pymupdf.Rect(image["bbox"]),
-                            fill=False,
-                            cross_out=False,
+                page_images = dict(self._page_images(page))
+                if image_id is not None:
+                    image = page_images.get(image_id)
+                    if image is None:
+                        raise HTTPException(
+                            status_code=status.HTTP_404_NOT_FOUND,
+                            detail="image not found",
                         )
-                    page.apply_redactions(images=2, graphics=0, text=0)
+                    page.delete_image(int(image["xref"]))
+                elif remove_images:
+                    # Preserve gradients, page decorations, and reused image
+                    # resources. Only independently editable XObjects are removed.
+                    for image in page_images.values():
+                        page.delete_image(int(image["xref"]))
                 return page.get_pixmap(
                     matrix=pymupdf.Matrix(scale, scale),
                     alpha=False,
@@ -291,12 +298,60 @@ class PdfService:
             )
         return font_map
 
+    def _is_page_decoration(
+        self,
+        page: pymupdf.Page,
+        image: dict[str, Any],
+        *,
+        real_image_count: int,
+    ) -> bool:
+        """Return whether an image is a page-edge decoration, not page content.
+
+        The three-edge rule intentionally requires another real image on the page.
+        This keeps a full-page scan editable while excluding banners/backgrounds
+        such as a full-width footer that sits behind a foreground photograph.
+        """
+        if real_image_count < 2:
+            return False
+        rect = self._display_rect(page, image["bbox"])
+        page_rect = page.rect
+        tolerance = max(1.0, min(page_rect.width, page_rect.height) * 0.005)
+        touches = sum(
+            (
+                abs(rect.x0 - page_rect.x0) <= tolerance,
+                abs(rect.y0 - page_rect.y0) <= tolerance,
+                abs(rect.x1 - page_rect.x1) <= tolerance,
+                abs(rect.y1 - page_rect.y1) <= tolerance,
+            )
+        )
+        width_ratio = rect.width / page_rect.width if page_rect.width else 0
+        height_ratio = rect.height / page_rect.height if page_rect.height else 0
+        return touches >= 3 and (width_ratio >= 0.9 or height_ratio >= 0.9)
+
     def _page_images(self, page: pymupdf.Page) -> list[tuple[str, dict[str, Any]]]:
-        return [
-            (f"image-{index}", image)
-            for index, image in enumerate(page.get_image_info(xrefs=True))
-            if pymupdf.Rect(image["bbox"]).get_area() > 0
+        """List only image XObjects that can be edited without collateral damage."""
+        image_xrefs = {int(row[0]) for row in page.get_images(full=True) if int(row[0]) > 0}
+        candidates = [
+            image
+            for image in page.get_image_info(hashes=True, xrefs=True)
+            if int(image.get("xref", 0)) in image_xrefs
+            and pymupdf.Rect(image["bbox"]).get_area() > 0
         ]
+        xref_counts: dict[int, int] = {}
+        for image in candidates:
+            xref = int(image["xref"])
+            xref_counts[xref] = xref_counts.get(xref, 0) + 1
+        independent = [image for image in candidates if xref_counts[int(image["xref"])] == 1]
+        editable = [
+            image
+            for image in independent
+            if not self._is_page_decoration(
+                page,
+                image,
+                real_image_count=len(independent),
+            )
+        ]
+        return [(f"image-{index}", image) for index, image in enumerate(editable)]
 
     def _image_info(
         self,
@@ -311,22 +366,23 @@ class PdfService:
     @staticmethod
     def _pixmap_png(document: pymupdf.Document, page: pymupdf.Page, image: dict[str, Any]) -> bytes:
         xref = int(image.get("xref", 0))
-        if xref > 0:
-            pixmap = pymupdf.Pixmap(document, xref)
-            image_row = next((row for row in page.get_images(full=True) if row[0] == xref), None)
-            smask = int(image_row[1]) if image_row else 0
-            if smask > 0:
-                mask = pymupdf.Pixmap(document, smask)
-                try:
-                    pixmap = pymupdf.Pixmap(pixmap, mask)
-                finally:
-                    mask = None
-            if pixmap.colorspace and pixmap.colorspace.n > 3:
-                pixmap = pymupdf.Pixmap(pymupdf.csRGB, pixmap)
-            return pixmap.tobytes("png")
-
-        clip = pymupdf.Rect(image["bbox"])
-        return page.get_pixmap(matrix=pymupdf.Matrix(2, 2), clip=clip, alpha=True).tobytes("png")
+        if xref <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                detail="image is not an independently editable PDF image object",
+            )
+        pixmap = pymupdf.Pixmap(document, xref)
+        image_row = next((row for row in page.get_images(full=True) if row[0] == xref), None)
+        smask = int(image_row[1]) if image_row else 0
+        if smask > 0:
+            mask = pymupdf.Pixmap(document, smask)
+            try:
+                pixmap = pymupdf.Pixmap(pixmap, mask)
+            finally:
+                mask = None
+        if pixmap.colorspace and pixmap.colorspace.n > 3:
+            pixmap = pymupdf.Pixmap(pymupdf.csRGB, pixmap)
+        return pixmap.tobytes("png")
 
     def extract_page_image(self, document_id: str, page_index: int, image_id: str) -> bytes:
         path = self.storage.original_path(document_id)
@@ -644,7 +700,10 @@ class PdfService:
                     start_y + font_size + index * line_height,
                 )
                 morph = (
-                    (pymupdf.Point(page.rect.x0 + page.rect.width * spec.x, center_y), pymupdf.Matrix(spec.rotation))
+                    (
+                        pymupdf.Point(page.rect.x0 + page.rect.width * spec.x, center_y),
+                        pymupdf.Matrix(spec.rotation),
+                    )
                     if abs(spec.rotation) > 0.01
                     else None
                 )
@@ -1197,6 +1256,9 @@ class PdfService:
         edited = pymupdf.open()
         edited.insert_pdf(source, from_page=spec.page_index, to_page=spec.page_index)
         page = edited[0]
+        source_page = source[spec.page_index]
+        source_page_images = dict(self._page_images(source_page))
+        copied_page_images = dict(self._page_images(page))
         try:
             prepared: list[
                 tuple[TextEdit, TextRunEdit | None, pymupdf.Rect, pymupdf.Rect]
@@ -1263,11 +1325,15 @@ class PdfService:
                     target_rect = target_rect.intersect(page.cropbox)
                     source_rect = source_rect.intersect(page.cropbox)
                     if target_rect.is_empty:
-                        target_id = run.span_id if run is not None else text_edit.block_id
-                        raise HTTPException(
-                            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                            detail=f"text box {target_id} is outside the page",
-                        )
+                        # The editor intentionally permits partly off-page objects. An
+                        # older client could also leave a box completely outside. PDF
+                        # pages clip that content, so preserve the edit by removing its
+                        # source object and omitting the invisible replacement instead
+                        # of failing the whole preview/export.
+                        if (run is None or not run.inserted) and not source_rect.is_empty:
+                            page.add_redact_annot(source_rect, fill=False, cross_out=False)
+                            has_text_redactions = True
+                        continue
                     if run is None or not run.inserted:
                         page.add_redact_annot(source_rect, fill=False, cross_out=False)
                         has_text_redactions = True
@@ -1275,13 +1341,11 @@ class PdfService:
             if has_text_redactions:
                 page.apply_redactions(images=0, graphics=0, text=0)
 
-            source_page = source[spec.page_index]
-            page_images = dict(self._page_images(source_page))
             prepared_images: list[
                 tuple[ImageEdit, dict[str, Any] | None, pymupdf.Rect]
             ] = []
             seen_image_ids: set[str] = set()
-            has_image_redactions = False
+            image_xrefs_to_delete: set[int] = set()
             for image_edit in spec.image_edits:
                 if image_edit.image_id in seen_image_ids:
                     raise HTTPException(
@@ -1307,13 +1371,21 @@ class PdfService:
                         )
                     prepared_images.append((image_edit, None, target_rect))
                     continue
-                image_info = page_images.get(image_edit.image_id)
+                image_info = source_page_images.get(image_edit.image_id)
+                copied_image_info = copied_page_images.get(image_edit.image_id)
                 if image_info is None:
                     raise HTTPException(
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=(
                             f"image {image_edit.image_id} does not belong to source page "
                             f"{spec.page_index}"
+                        ),
+                    )
+                if copied_image_info is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+                        detail=(
+                            f"image {image_edit.image_id} could not be mapped to the copied page"
                         ),
                     )
                 source_rect = self._display_rect(source_page, image_info["bbox"])
@@ -1338,11 +1410,10 @@ class PdfService:
                         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
                         detail=f"image box {image_edit.image_id} is outside the page",
                     )
-                page.add_redact_annot(source_rect, fill=False, cross_out=False)
-                has_image_redactions = True
+                image_xrefs_to_delete.add(int(copied_image_info["xref"]))
                 prepared_images.append((image_edit, image_info, target_rect))
-            if has_image_redactions:
-                page.apply_redactions(images=2, graphics=0, text=0)
+            for image_xref in image_xrefs_to_delete:
+                page.delete_image(image_xref)
 
             for image_edit, image_info, target_rect in prepared_images:
                 if image_edit.action == "delete":
@@ -1462,10 +1533,7 @@ class PdfService:
                                 run.bbox.y1,
                             ).intersect(target_page.rect)
                             if target_rect.is_empty:
-                                raise HTTPException(
-                                    status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                                    detail=f"text box {run.span_id} is outside the page",
-                                )
+                                continue
                             result = self._write_text_run(
                                 output,
                                 target_page,

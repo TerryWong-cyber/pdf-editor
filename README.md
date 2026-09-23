@@ -19,7 +19,10 @@ frontend development by default.
 
 - `POST /api/v1/documents`: upload one or more PDFs. Multiple files are appended in upload order.
 - `GET /api/v1/documents/{id}/pages/{page}/preview`: render a page thumbnail.
-- `GET /api/v1/documents/{id}/pages/{page}/edit-background`: render the page background with text removed.
+- `GET /api/v1/documents/{id}/pages/{page}/edit-background`: render the page background
+  with text removed. Pass `image_id` to remove one independently editable image while
+  preserving overlapping page graphics; `remove_images=true` remains available for legacy
+  clients and removes all independently editable images.
 - `GET /api/v1/documents/{id}/pages/{page}/content`: parse text blocks, styled spans,
   character geometry, and editable image regions.
 - `GET /api/v1/documents/{id}/pages/{page}/images/{image_id}/preview`: return a PNG source
@@ -39,8 +42,10 @@ frontend development by default.
 Delete, copy, reorder, extract, merge, rotate, crop, and blank-page creation all map to the
 ordered `pages` array accepted by the export endpoint. Each page can also carry a watermark
 configuration with arbitrary rotation, page-relative scale, opacity, and normalized position.
-Source pages may additionally carry `text_edits` and `image_edits`; export redacts only the
-changed original regions and writes moved text or deleted/replaced images into the new copy.
+Source pages may additionally carry `text_edits` and `image_edits`; export redacts changed
+text regions, removes edited image XObjects by identity, and writes moved or replaced images
+into the new copy. Render-only layers, reused image resources, and page-edge decorations are
+kept in the page background instead of being exposed as independently editable images.
 Multilingual output selects the configured Noto font by script. The server paths are listed in
 `.env.example`.
 When the source PDF embeds a compatible font and it contains every newly entered glyph, the
