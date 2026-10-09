@@ -15,6 +15,89 @@ The API docs are available at `http://localhost:8000/docs`. Copy `.env.example` 
 to override defaults. Both `localhost:5173` and `127.0.0.1:5173` are allowed for local
 frontend development by default.
 
+## Deploy with Docker Compose
+
+The Compose deployment runs the backend on port 8000 with one Uvicorn worker, a health
+check, automatic restart, and a non-root user (UID/GID 10001). No database or other service
+is required. Python dependencies are installed from `uv.lock`. The image includes Noto
+fonts for Chinese, Japanese, Korean, Latin, Arabic, Cyrillic, Thai, and Vietnamese text.
+
+```bash
+cp .env.docker.example .env.docker
+# Edit .env.docker for the frontend origin and host port.
+docker compose --env-file .env.docker config --quiet
+docker compose --env-file .env.docker up -d --build
+docker compose --env-file .env.docker ps
+curl --fail http://127.0.0.1:8000/health
+```
+
+The health endpoint should return `{"status":"ok"}`; API docs are at
+`http://127.0.0.1:8000/docs`. Substitute your configured `PDF_EDITOR_PORT` in these URLs.
+`PDF_EDITOR_PORT` controls only the **host** port. The container always listens on 8000;
+for example, `PDF_EDITOR_PORT=8020` maps host port 8020 to container port 8000. Keep the
+Dockerfile command and Compose healthcheck on container port 8000. Compose explicitly
+sets the startup command so that older images with another default port can be reused.
+Inspect startup failures with:
+
+```bash
+docker compose --env-file .env.docker logs --tail=100 pdf-editor-api
+```
+
+Container settings are isolated from the local `.env`, which is neither copied into the
+image nor loaded by the container. Adapt the following deployment values:
+
+| Setting | Container behavior |
+| --- | --- |
+| `PDF_EDITOR_CORS_ORIGINS` | Set to the browser frontend origin, e.g. `https://editor.example.com`; multiple origins are comma-separated. Do not include `/pdf-editor` or other paths. |
+| `PDF_EDITOR_MAX_UPLOAD_MB` | Defaults to 100 MB per uploaded file. Align the reverse proxy's body-size limit with your intended multi-file request size. |
+| `PDF_EDITOR_DATA_DIR` | Compose fixes this to `/data` and mounts the `pdf-editor-data` named volume. |
+| `FONT_*` | `.env.docker` overrides image defaults with the host font paths; Compose mounts `/usr/share/fonts/opentype/noto` read-only at the same container path. |
+| `PDF_EDITOR_BIND_ADDRESS` / `PDF_EDITOR_PORT` | Control the host port mapping; default `127.0.0.1:8000`. Set the bind address to `0.0.0.0` for direct access from other machines. |
+
+The Dockerfile uses Debian's static Noto fonts, so the container font filenames differ
+from the variable-font paths in the local `.env.example`. CJK font collections are split
+into standalone regional faces during the build. The provided Compose configuration uses
+the host variable fonts instead: all `FONT_*` entries in `.env.docker.example` match the
+absolute paths in the local `.env`. No font copy is needed. The directory and the configured
+files must exist on the **Docker host** (the machine running the Docker daemon), and be
+readable by UID/GID 10001. A missing host directory fails deployment rather than silently
+creating an empty directory. Verify the mounted files after startup:
+
+```bash
+docker compose --env-file .env.docker exec pdf-editor-api python -c \
+  'from app.config import settings; from pathlib import Path; import pymupdf; paths = {getattr(settings, name) for name in type(settings).model_fields if name.startswith("font_")}; [(print(path), pymupdf.Font(fontfile=str(path))) for path in sorted(paths)]'
+```
+
+To use the bundled image fonts instead, remove the host font bind mount from Compose
+and remove the `FONT_*` overrides from `.env.docker`. Other custom fonts can be mounted
+read-only, for example `./fonts:/custom-fonts:ro`, with matching `FONT_*` entries.
+Use the existing `FONT_*` names when overriding image defaults rather than their
+`PDF_EDITOR_FONT_*` aliases, because `FONT_*` has priority in the settings loader.
+
+Original PDFs, exports, watermarks, and edited images persist across container recreation
+in the named volume. The existing host `./data` directory is **not** migrated automatically.
+To use that directory instead, replace the volume mount with `./data:/data` and ensure it
+is writable by UID/GID 10001. Back up the data before migration. `docker compose down`
+preserves the named volume; adding `-v` deletes it.
+
+For a reverse proxy on the host, forward to `http://127.0.0.1:8000`. A proxy in another
+container needs a shared Docker network and should forward to `http://pdf-editor-api:8000`.
+If serving under `/pdf-editor/`, strip that prefix before forwarding: the backend routes
+remain `/api/v1/...`, and the frontend API base should be `/pdf-editor/api/v1`. Download
+URLs returned by the backend are relative to the backend root, so the frontend must
+resolve them through its configured public API base.
+
+After startup, verify an actual PDF operation as well as the health endpoint:
+
+```bash
+curl --fail -F 'files=@/absolute/path/sample.pdf;type=application/pdf' \
+  http://127.0.0.1:8000/api/v1/documents
+curl --fail -H 'Content-Type: application/json' \
+  -d '{"filename":"smoke.pdf","pages":[{"kind":"blank"}]}' \
+  http://127.0.0.1:8000/api/v1/exports
+# Download the download_url returned by the second request using the same server origin.
+```
+
 ## Main API
 
 - `POST /api/v1/documents`: upload one or more PDFs. Multiple files are appended in upload order.

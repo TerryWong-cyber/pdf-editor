@@ -1,0 +1,43 @@
+services:
+  pdf-editor-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    env_file:
+      - .env.docker
+    environment:
+      PDF_EDITOR_DATA_DIR: /data
+    # Keep the container port aligned with the mapping and healthcheck,
+    # including when reusing an image built with a different default CMD.
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    ports:
+      # PDF_EDITOR_PORT changes only the host port; the container stays on 8000.
+      - "${PDF_EDITOR_BIND_ADDRESS:-127.0.0.1}:${PDF_EDITOR_PORT:-8000}:8000"
+    volumes:
+      - pdf-editor-data:/data
+      # Preserve the absolute FONT_* paths configured in .env.docker.
+      - type: bind
+        source: /usr/share/fonts/opentype/noto
+        target: /usr/share/fonts/opentype/noto
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3); assert json.load(r)['status'] == 'ok'"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  pdf-editor-data:
