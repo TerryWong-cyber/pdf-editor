@@ -7,14 +7,14 @@ from fastapi.testclient import TestClient
 
 from app.config import settings
 from app.dependencies import get_storage
-from app.main import app
+from app.main import create_app
 
 
 @pytest.fixture
 def client(tmp_path: Path) -> Iterator[TestClient]:
     settings.data_dir = tmp_path / "data"
     get_storage.cache_clear()
-    with TestClient(app) as test_client:
+    with TestClient(create_app()) as test_client:
         yield test_client
     get_storage.cache_clear()
 

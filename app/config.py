@@ -1,6 +1,7 @@
 from pathlib import Path
+from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +14,34 @@ class Settings(BaseSettings):
 
     data_dir: Path = Path("data")
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
-    max_upload_mb: int = 100
+    max_upload_mb: int = Field(default=100, ge=1)
+    mcp_enabled: bool = True
+    mcp_max_concurrency: int = Field(default=2, ge=1, le=16)
+    # JSON mapping: stable principal name -> secret Bearer token.
+    api_keys: dict[str, str] = Field(default_factory=dict)
+    public_base_url: str = ""
+
+    @model_validator(mode="after")
+    def validate_access_settings(self):
+        if any(not name.strip() or not token.strip() for name, token in self.api_keys.items()):
+            raise ValueError("API identities and tokens must not be empty")
+        if len(set(self.api_keys.values())) != len(self.api_keys):
+            raise ValueError("each API identity must have a distinct token")
+        if self.public_base_url:
+            url = urlsplit(self.public_base_url)
+            if (
+                url.scheme not in {"http", "https"}
+                or not url.netloc
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+            ):
+                raise ValueError(
+                    "public_base_url must be an HTTP(S) origin with optional path prefix"
+                )
+        return self
+
     font_file: Path = Field(
         default=Path("/usr/share/fonts/opentype/noto/NotoSansSC-VF.ttf"),
         validation_alias=AliasChoices("FONT_FILE", "PDF_EDITOR_FONT_FILE"),
