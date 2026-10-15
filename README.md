@@ -220,7 +220,7 @@ the same rotated-page coordinate space as text edits and previews.
 
 ## MCP integration
 
-The backend exposes 18 typed tools at `/mcp/` beside the existing REST API.
+The backend exposes 19 typed tools at `/mcp/` beside the existing REST API.
 The adapter uses the official MCP Python SDK 1.x, Streamable HTTP, stateless requests,
 and JSON responses. It shares `EditorService`, `PdfService`, and `FileStorage` with
 REST; it does not send HTTP requests back to itself or duplicate PDF engine logic.
@@ -240,6 +240,7 @@ No model or chat UI is embedded in the backend.
 
 | Tool | Purpose |
 | --- | --- |
+| `import_file_from_url` | Import a public/signed URL as a document, image or watermark |
 | `list_pdf_capabilities` | Operations, limits, unsupported features, uploads and coordinates |
 | `get_document_info` | Original filename, page count, page sizes and rotations |
 | `get_page_content` | Block/span/image IDs; summary, spans, or optional character detail |
@@ -265,10 +266,12 @@ Resource links point to HTTP downloads; they are not a separate MCP `resources/r
 
 ### File references and page conventions
 
-Upload chat attachments through `POST /api/v1/documents` with multipart field `files`.
-Use the returned array entry's `id` as `document_id`. Existing REST-uploaded document IDs
-work directly in MCP when using the same identity. MCP accepts only service references;
-it has no arbitrary local-path, external-URL, or base64 PDF import tool.
+For a public/signed file URL, call `import_file_from_url(file_url, filename?, kind="document")`.
+Use the returned `id` as `document_id`. `kind="image"` and `kind="watermark"` import replacement
+images and watermark assets using the same validators as their REST upload endpoints.
+REST clients can use `POST /api/v1/files/import-url` with the same JSON fields.
+Existing `POST /api/v1/documents` multipart uploads (`files`) and their IDs remain supported.
+Editing operations still use service references. Local paths and Base64 PDF input are not supported.
 Upload image/watermark assets using the existing `/api/v1/images` or `/api/v1/watermarks`
 endpoints (multipart field `file`). Then use their IDs in `compose_pdf`/`update_draft`.
 
@@ -341,7 +344,8 @@ revision snapshot even if another client subsequently changes the draft.
 
 An empty key mapping retains the existing **local single-user** workflow. Before remote use,
 configure strong tokens, for example `{"agent-user":"REPLACE_WITH_A_RANDOM_SECRET"}`.
-Then send `Authorization: Bearer <secret>` on **both REST and MCP**, including downloads.
+Then send `Authorization: Bearer <secret>` on **both REST and MCP**, including legacy `download_url` downloads.
+New `files[].file_url` links are signed, export-scoped and can be fetched without a Bearer token until expiry.
 `/health` and CORS preflight remain unauthenticated. This is static Bearer authentication,
 not OAuth discovery; use a client that supports custom authorization headers.
 Existing browser clients also need to send the header if you enable authentication.
@@ -386,3 +390,43 @@ PNG preview, page composition, authentication, cross-identity isolation and Host
 The smoke script uses the official SDK against a real HTTP listener and downloads/inspects
 both the extracted and edited PDFs. These checks do not constitute a natural-language model
 or production-proxy E2E test; that requires a configured agent/model and deployed endpoint.
+
+
+### URL imports and portable result files
+
+```json
+{"file_url":"https://files.example.com/manual.pdf?signature=...","kind":"document"}
+```
+
+The importer streams to bounded temporary storage, verifies the actual file format using existing
+upload validators, and preserves the authenticated caller's namespace. HTTP(S) sources must be
+public or their exact hostname/IP must be explicitly allowed. Each redirect is checked again;
+DNS answers are validated and TCP connections are pinned to a validated IP while HTTPS retains
+hostname certificate verification. User credentials, fragments, arbitrary forwarded headers,
+unsupported schemes and compressed HTTP transfer representations are rejected. Up to three
+redirects are followed. Source query strings (including cloud signatures) are preserved. A cloud
+share page must first be resolved to a real download URL. URL inputs are not persisted as metadata.
+
+New configuration:
+
+```dotenv
+# JSON list of exact private storage hosts (no ports or wildcards); public hosts need no entry
+PDF_EDITOR_URL_IMPORT_ALLOWED_HOSTS=["files.internal","192.168.3.67"]
+PDF_EDITOR_URL_IMPORT_TIMEOUT_SECONDS=120
+PDF_EDITOR_DOWNLOAD_URL_TTL_SECONDS=3600
+# At least 32 random characters; share across workers/restarts
+PDF_EDITOR_DOWNLOAD_SIGNING_KEY=replace-with-at-least-32-random-characters
+```
+
+The URL import byte limit is the existing document/image/watermark upload limit. Imports are
+limited to two concurrent downloads per process. Downloads do not use ambient proxy settings.
+Configure `PDF_EDITOR_PUBLIC_BASE_URL` to a downstream-accessible origin/prefix.
+Exports now include `files[]` with `file_url`, `filename`, `mime_type`, `size_bytes`, and ISO UTC
+`expires_at`. MCP resource links point to the signed URL. Legacy `download_url` stays compatible
+and keeps its Bearer authentication. Signed URLs grant only GET access to one export under its
+original identity; changing the filename, export, owner, expiry or signature invalidates the link.
+They grant no editing/API access and should be handled as temporary credentials.
+Without a configured signing key a process-local random key is used; restart invalidates old links
+and multiple workers cannot share them. The signing key is independent of API keys. Changing it
+revokes old links. Signed URL expiry does not delete the export; export again to get a fresh URL.
+No cloud storage account or permanent cloud-file writeback is configured by this change.

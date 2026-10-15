@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class PageMetadata(BaseModel):
@@ -342,11 +342,27 @@ class TextEditResult(BaseModel):
     overflow_action: Literal["none", "shrink"] = "none"
 
 
+class FileArtifact(BaseModel):
+    file_url: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    expires_at: str
+
+
+class URLImportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    file_url: str = Field(min_length=1, max_length=16384)
+    filename: str | None = Field(default=None, min_length=1, max_length=180)
+    kind: Literal["document", "image", "watermark"] = "document"
+
+
 class ExportResponse(BaseModel):
     id: str
     filename: str
     page_count: int
     download_url: str
+    files: list[FileArtifact] = Field(default_factory=list)
     text_edit_results: list[TextEditResult] = Field(default_factory=list)
 
 

@@ -12,14 +12,17 @@ from fastapi import HTTPException, UploadFile
 
 from app.agent_schemas import AgentExportRequest, AgentSourcePage, SpanReplacement
 from app.config import settings
+from app.download_links import signed_export_url
 from app.schemas import (
     DocumentMetadata,
     ExportRequest,
     ExportResponse,
+    FileArtifact,
     SourcePage,
     TextEdit,
     TextRunEdit,
 )
+from app.security import principal
 from app.services.pdf_service import PdfService
 from app.services.storage import FileStorage, safe_pdf_filename
 
@@ -106,6 +109,7 @@ class EditorService:
         export_id, destination = self.storage.allocate_export()
         filename = safe_pdf_filename(request.filename, "edited-copy.pdf")
         results = self.pdf.compose(request.model_copy(update={"filename": filename}), destination)
+        url, expires = signed_export_url(export_id, filename, principal.get())
         return ExportResponse(
             id=export_id,
             filename=filename,
@@ -113,13 +117,18 @@ class EditorService:
             download_url=(
                 f"/api/v1/exports/{export_id}/download?{urlencode({'filename': filename})}"
             ),
+            files=[FileArtifact(
+                file_url=url, filename=filename, mime_type="application/pdf",
+                size_bytes=destination.stat().st_size, expires_at=expires,
+            )],
             text_edit_results=results,
         )
 
     def agent_export(self, request: AgentExportRequest) -> dict:
         self.validate(request)
         result = self.export(self.rest_request(request)).model_dump()
-        result["download_url"] = settings.public_base_url.rstrip("/") + result["download_url"]
+        if result["download_url"].startswith("/"):
+            result["download_url"] = settings.public_base_url.rstrip("/") + result["download_url"]
         result["source_unchanged"] = True
         result["can_import_as_document"] = True
         result["warnings"] = [

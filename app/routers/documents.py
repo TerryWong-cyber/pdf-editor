@@ -1,8 +1,11 @@
+import asyncio
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, Response
+from starlette.datastructures import Headers
 
+from app.config import settings
 from app.dependencies import get_editor_service, get_pdf_service, get_storage
 from app.schemas import (
     DocumentMetadata,
@@ -11,11 +14,13 @@ from app.schemas import (
     ExportResponse,
     ImageAssetMetadata,
     PageContent,
+    URLImportRequest,
     WatermarkMetadata,
 )
 from app.services.editor_service import EditorService
 from app.services.pdf_service import PdfService
 from app.services.storage import FileStorage, safe_pdf_filename
+from app.url_files import fetch_file
 
 router = APIRouter()
 WATERMARK_MAX_BYTES = 20 * 1024 * 1024
@@ -251,4 +256,41 @@ def download_export(
         storage.export_path(export_id),
         media_type="application/pdf",
         filename=safe_pdf_filename(filename, "edited-copy.pdf"),
+        headers={"Cache-Control": "private, no-store", "Referrer-Policy": "no-referrer"},
     )
+
+
+url_import_slots = asyncio.Semaphore(2)
+
+
+@router.post("/files/import-url", status_code=201)
+async def import_file_from_url(request: URLImportRequest):
+    """Import a signed/public URL into the caller's existing file namespace."""
+    async with url_import_slots:
+        return await _import_url(request)
+
+
+async def _import_url(request: URLImportRequest):
+    limits = {
+        "document": settings.max_upload_mb * 1024 * 1024,
+        "image": IMAGE_MAX_BYTES, "watermark": WATERMARK_MAX_BYTES,
+    }
+    remote = await fetch_file(
+        request.file_url, request.filename, max_bytes=limits[request.kind],
+        timeout_seconds=settings.url_import_timeout_seconds,
+        allowed_hosts=settings.url_import_allowed_hosts,
+    )
+    upload = UploadFile(
+        file=remote.file, filename=remote.filename, size=remote.size,
+        headers=Headers({"content-type": remote.content_type}),
+    )
+    try:
+        if request.kind == "document":
+            result = await get_editor_service().upload(upload)
+        elif request.kind == "image":
+            result = await upload_image(upload, get_storage(), get_pdf_service())
+        else:
+            result = await upload_watermark(upload, get_storage(), get_pdf_service())
+        return {**result.model_dump(), "kind": request.kind}
+    finally:
+        await upload.close()

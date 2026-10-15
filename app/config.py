@@ -1,7 +1,7 @@
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from pydantic import AliasChoices, Field, model_validator
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     # JSON mapping: stable principal name -> secret Bearer token.
     api_keys: dict[str, str] = Field(default_factory=dict)
     public_base_url: str = ""
+    url_import_allowed_hosts: list[str] = Field(default_factory=list)
+    url_import_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    download_url_ttl_seconds: int = Field(default=3600, ge=1, le=86400)
+    download_signing_key: SecretStr = SecretStr("")
 
     @model_validator(mode="after")
     def validate_access_settings(self):
@@ -27,6 +31,9 @@ class Settings(BaseSettings):
             raise ValueError("API identities and tokens must not be empty")
         if len(set(self.api_keys.values())) != len(self.api_keys):
             raise ValueError("each API identity must have a distinct token")
+        signing_key = self.download_signing_key.get_secret_value()
+        if signing_key and len(signing_key) < 32:
+            raise ValueError("download_signing_key must be at least 32 characters")
         if self.public_base_url:
             url = urlsplit(self.public_base_url)
             if (

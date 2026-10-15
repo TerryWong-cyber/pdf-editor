@@ -372,7 +372,8 @@ def test_download_resource_link_with_asgi_proxy_prefix(client, sample_pdf):
         artifact = data(result)
         assert artifact["download_url"].startswith("http://localhost/pdf-editor/api/v1/exports/")
         link = next(item for item in result["content"] if item["type"] == "resource_link")
-        assert link["uri"] == artifact["download_url"]
+        assert link["uri"] == artifact["files"][0]["file_url"]
+        assert prefixed.get(link["uri"]).status_code == 200
         assert link["mimeType"] == "application/pdf"
 
 

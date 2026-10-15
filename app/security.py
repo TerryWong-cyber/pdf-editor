@@ -1,12 +1,16 @@
 """Request identity shared by REST and MCP; no identity supplied by tool arguments."""
 
 import hashlib
+import re
 import secrets
 from contextvars import ContextVar
+from urllib.parse import parse_qs
 
+from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from app.config import settings
+from app.download_links import request_origin, verify_export_url
 
 principal: ContextVar[str | None] = ContextVar("pdf_editor_principal", default=None)
 
@@ -20,7 +24,22 @@ class IdentityMiddleware:
             await self.app(scope, receive, send)
             return
         owner = None
-        if settings.api_keys and scope["method"] != "OPTIONS":
+        signed = False
+        path = scope["path"].removeprefix(scope.get("root_path", ""))
+        match = re.fullmatch(r"/api/v1/exports/([a-f0-9-]{36})/download", path)
+        query = parse_qs(scope.get("query_string", b"").decode("latin-1"), keep_blank_values=True)
+        if scope["method"] == "GET" and match and "signature" in query:
+            signed, owner = verify_export_url(match[1], query)
+            if not signed:
+                await JSONResponse(
+                    {"detail": "download link is invalid or expired"}, status_code=401
+                )(
+                    scope,
+                    receive,
+                    send,
+                )
+                return
+        if settings.api_keys and not signed and scope["method"] != "OPTIONS":
             headers = dict(scope["headers"])
             authorization = headers.get(b"authorization", b"").decode("latin-1")
             scheme, _, token = authorization.partition(" ")
@@ -38,7 +57,9 @@ class IdentityMiddleware:
                 await response(scope, receive, send)
                 return
         identity_token = principal.set(owner)
+        origin_token = request_origin.set(str(Request(scope).base_url).rstrip("/"))
         try:
             await self.app(scope, receive, send)
         finally:
             principal.reset(identity_token)
+            request_origin.reset(origin_token)
